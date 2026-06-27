@@ -154,11 +154,31 @@ def train(cfg: Config) -> str:
 
     start_epoch = 0
     best_f1 = -1.0
-    if cfg.train.resume:
-        ckpt = load_checkpoint(cfg.train.resume, model, optimizer, scheduler, scaler, map_location=device)
-        start_epoch = ckpt.get("epoch", 0)
-        best_f1 = ckpt.get("best_metric") or -1.0
-        log.info(f"Resumed from {cfg.train.resume} at epoch {start_epoch} (best_f1={best_f1:.4f})")
+
+    # ---- Resume logic (train resume purposes) ----
+    # Priority: explicit cfg.train.resume > BEST > LAST > from scratch.
+    # When resuming we restore model + optimizer + scheduler + scaler + epoch +
+    # best_metric so training continues seamlessly from where it left off.
+    resume_path = cfg.train.resume
+    if resume_path is None:
+        best_path = out_dir / "net_weights_BEST.pt"
+        last_path = out_dir / "net_weights_LAST.pt"
+        if best_path.exists():
+            resume_path = str(best_path)
+            log.info(f"Found existing BEST weights -> resuming from {resume_path}")
+        elif last_path.exists():
+            resume_path = str(last_path)
+            log.info(f"Found existing LAST weights -> resuming from {resume_path}")
+
+    if resume_path is not None and Path(resume_path).exists():
+        ckpt = load_checkpoint(resume_path, model, optimizer, scheduler, scaler, map_location=device)
+        start_epoch = int(ckpt.get("epoch", 0)) + 1  # continue from the NEXT epoch
+        best_f1 = float(ckpt.get("best_metric") or -1.0)
+        log.info(f"Resumed from {resume_path} -> start_epoch={start_epoch} best_f1={best_f1:.4f}")
+    elif resume_path is not None:
+        log.warning(f"Resume path {resume_path} does not exist; training from scratch.")
+    else:
+        log.info("No existing checkpoint found; training from scratch.")
 
     # ---- Datasets / loaders ------------------------------------------
     augment = Augment3D()
