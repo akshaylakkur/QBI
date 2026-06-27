@@ -148,10 +148,22 @@
 
           <article class="panel detail-panel">
             <div class="panel-heading">
-              <h2>Slice preview</h2>
-              <span id="slice-label" class="status-pill active">Z -</span>
+              <h2>Slice previews</h2>
             </div>
-            <canvas id="slice-canvas" class="slice-preview" width="158" height="158" aria-label="2D tomogram slice preview"></canvas>
+            <div class="slice-preview-grid">
+              <div class="slice-preview-item">
+                <span id="x-slice-label" class="status-pill axis-x">X -</span>
+                <canvas id="x-slice-canvas" class="slice-preview" width="158" height="158" aria-label="X axis tomogram slice preview"></canvas>
+              </div>
+              <div class="slice-preview-item">
+                <span id="y-slice-label" class="status-pill axis-y">Y -</span>
+                <canvas id="y-slice-canvas" class="slice-preview" width="158" height="158" aria-label="Y axis tomogram slice preview"></canvas>
+              </div>
+              <div class="slice-preview-item">
+                <span id="z-slice-label" class="status-pill axis-z">Z -</span>
+                <canvas id="z-slice-canvas" class="slice-preview" width="158" height="158" aria-label="Z axis tomogram slice preview"></canvas>
+              </div>
+            </div>
           </article>
 
           <article class="panel info-panel">

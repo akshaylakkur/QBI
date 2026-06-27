@@ -41,8 +41,16 @@ const elements = {
   selectedConfidence: document.querySelector("#selected-confidence"),
   selectedPosition: document.querySelector("#selected-position"),
   selectedNotes: document.querySelector("#selected-notes"),
-  sliceCanvas: document.querySelector("#slice-canvas"),
-  sliceLabel: document.querySelector("#slice-label"),
+  sliceCanvases: {
+    x: document.querySelector("#x-slice-canvas"),
+    y: document.querySelector("#y-slice-canvas"),
+    z: document.querySelector("#z-slice-canvas")
+  },
+  sliceLabels: {
+    x: document.querySelector("#x-slice-label"),
+    y: document.querySelector("#y-slice-label"),
+    z: document.querySelector("#z-slice-label")
+  },
   resetCamera: document.querySelector("#reset-camera"),
   rotateToggle: document.querySelector("#rotate-toggle"),
   openSlicer: document.querySelector("#open-slicer"),
@@ -258,7 +266,8 @@ function createSliceMaterial(axis, texture) {
     uZ: { value: normalizedSlicePosition("z") },
     uGap: { value: 0.0035 },
     uBrightness: { value: 1.35 },
-    uGamma: { value: 0.72 }
+    uGamma: { value: 0.72 },
+    uLineWidth: { value: 0.0045 }
   };
 
   return new THREE.ShaderMaterial({
@@ -290,17 +299,32 @@ function createSliceMaterial(axis, texture) {
       uniform float uGap;
       uniform float uBrightness;
       uniform float uGamma;
+      uniform float uLineWidth;
       varying vec2 vUv;
       varying vec3 vWorldPosition;
 
       void main() {
         bool cut = false;
+        vec3 lineColor = vec3(1.0);
+        float lineMask = 0.0;
         if (uAxis == 0) {
-          cut = abs(vWorldPosition.y - uY) < uGap || abs(vWorldPosition.z - uZ) < uGap;
+          float yLine = 1.0 - smoothstep(uLineWidth, uLineWidth * 1.8, abs(vWorldPosition.y - uY));
+          float zLine = 1.0 - smoothstep(uLineWidth, uLineWidth * 1.8, abs(vWorldPosition.z - uZ));
+          cut = abs(vWorldPosition.y - uY) < uGap && abs(vWorldPosition.z - uZ) < uGap;
+          lineMask = max(yLine, zLine);
+          lineColor = yLine >= zLine ? vec3(0.15, 0.78, 0.22) : vec3(0.1, 0.38, 1.0);
         } else if (uAxis == 1) {
-          cut = abs(vWorldPosition.x - uX) < uGap || abs(vWorldPosition.z - uZ) < uGap;
+          float xLine = 1.0 - smoothstep(uLineWidth, uLineWidth * 1.8, abs(vWorldPosition.x - uX));
+          float zLine = 1.0 - smoothstep(uLineWidth, uLineWidth * 1.8, abs(vWorldPosition.z - uZ));
+          cut = abs(vWorldPosition.x - uX) < uGap && abs(vWorldPosition.z - uZ) < uGap;
+          lineMask = max(xLine, zLine);
+          lineColor = xLine >= zLine ? vec3(1.0, 0.1, 0.08) : vec3(0.1, 0.38, 1.0);
         } else {
-          cut = abs(vWorldPosition.x - uX) < uGap || abs(vWorldPosition.y - uY) < uGap;
+          float xLine = 1.0 - smoothstep(uLineWidth, uLineWidth * 1.8, abs(vWorldPosition.x - uX));
+          float yLine = 1.0 - smoothstep(uLineWidth, uLineWidth * 1.8, abs(vWorldPosition.y - uY));
+          cut = abs(vWorldPosition.x - uX) < uGap && abs(vWorldPosition.y - uY) < uGap;
+          lineMask = max(xLine, yLine);
+          lineColor = xLine >= yLine ? vec3(1.0, 0.1, 0.08) : vec3(0.15, 0.78, 0.22);
         }
         if (cut) {
           discard;
@@ -308,6 +332,7 @@ function createSliceMaterial(axis, texture) {
 
         vec4 color = texture2D(uTexture, vUv);
         color.rgb = pow(color.rgb, vec3(uGamma)) * uBrightness;
+        color.rgb = mix(color.rgb, lineColor, clamp(lineMask * 0.85, 0.0, 1.0));
         gl_FragColor = vec4(clamp(color.rgb, 0.0, 1.0), color.a);
       }
     `
@@ -367,6 +392,84 @@ function updateVolumeSlicePlane(axis, bytes, width, height) {
   positionSlicePlane(axis, slicePlaneObjects[axis]);
   updateSliceSeams();
   setActiveSliceAxis(state.activeSliceAxis);
+}
+
+function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedIndex) {
+  const canvas = elements.sliceCanvases[axis];
+  if (!canvas) {
+    return;
+  }
+
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const image = context.createImageData(width, height);
+
+  for (let index = 0; index < bytes.length; index += 1) {
+    const value = bytes[index];
+    image.data[index * 4] = value;
+    image.data[index * 4 + 1] = value;
+    image.data[index * 4 + 2] = value;
+    image.data[index * 4 + 3] = 255;
+  }
+
+  context.putImageData(image, 0, 0);
+
+  const xRatio = state.currentSlices.x / Math.max(1, state.volume.shape.x - 1);
+  const yRatio = state.currentSlices.y / Math.max(1, state.volume.shape.y - 1);
+  const zRatio = state.currentSlices.z / Math.max(1, state.volume.shape.z - 1);
+  const lines = axis === "x"
+    ? [
+        { color: "#26c943", vertical: yRatio },
+        { color: "#2465ff", horizontal: zRatio }
+      ]
+    : axis === "y"
+      ? [
+          { color: "#ff2b23", vertical: xRatio },
+          { color: "#2465ff", horizontal: zRatio }
+        ]
+      : [
+          { color: "#ff2b23", vertical: xRatio },
+          { color: "#26c943", horizontal: yRatio }
+        ];
+
+  context.save();
+  context.lineWidth = Math.max(1, Math.round(Math.min(width, height) * 0.006));
+  lines.forEach((line) => {
+    context.strokeStyle = line.color;
+    context.beginPath();
+    if (Number.isFinite(line.vertical)) {
+      const x = Math.round(line.vertical * (width - 1)) + 0.5;
+      context.moveTo(x, 0);
+      context.lineTo(x, height);
+    } else {
+      const y = Math.round(line.horizontal * (height - 1)) + 0.5;
+      context.moveTo(0, y);
+      context.lineTo(width, y);
+    }
+    context.stroke();
+  });
+  context.restore();
+
+  elements.sliceLabels[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]} | L${renderedLevel} ${renderedIndex}`;
+}
+
+function refreshSlicePreviews() {
+  sliceAxes.forEach((axis) => {
+    const canvas = elements.sliceCanvases[axis];
+    if (!canvas?.width || !canvas?.height) {
+      return;
+    }
+
+    const context = canvas.getContext("2d");
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const bytes = new Uint8ClampedArray(canvas.width * canvas.height);
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = image.data[index * 4];
+    }
+
+    drawSlicePreview(axis, bytes, canvas.width, canvas.height, "-", "-");
+  });
 }
 
 function renderPointCloud(payload) {
@@ -616,27 +719,7 @@ async function loadSlice(axis = "z") {
 
   elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
   elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
-
-  if (axis !== "z") {
-    return;
-  }
-
-  const canvas = elements.sliceCanvas;
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d");
-  const image = context.createImageData(width, height);
-
-  for (let index = 0; index < bytes.length; index += 1) {
-    const value = bytes[index];
-    image.data[index * 4] = value;
-    image.data[index * 4 + 1] = value;
-    image.data[index * 4 + 2] = value;
-    image.data[index * 4 + 3] = 255;
-  }
-
-  context.putImageData(image, 0, 0);
-  elements.sliceLabel.textContent = `Z ${state.currentSlices.z} | L${renderedLevel} ${renderedIndex}`;
+  drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedIndex);
 }
 
 async function uploadZarrFolder() {
@@ -785,6 +868,7 @@ sliceAxes.forEach((axis) => {
     elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
     setActiveSliceAxis(axis);
     updateSliceSeams();
+    refreshSlicePreviews();
     loadSlice(axis).catch(showError);
   });
 });

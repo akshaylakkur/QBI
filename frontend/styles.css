@@ -481,9 +481,21 @@ input[type="range"] {
   background: var(--amber);
 }
 
+.slice-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.slice-preview-item {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
 .slice-preview {
   min-height: 210px;
-  margin-top: 14px;
   position: relative;
   overflow: hidden;
   display: grid;
@@ -501,10 +513,25 @@ input[type="range"] {
 canvas.slice-preview {
   display: block;
   width: 100%;
-  height: 210px;
+  height: 170px;
   image-rendering: pixelated;
   object-fit: contain;
   background: #172026;
+}
+
+.status-pill.axis-x {
+  background: #ffe5e2;
+  color: #9d1610;
+}
+
+.status-pill.axis-y {
+  background: #e4f7e7;
+  color: #116526;
+}
+
+.status-pill.axis-z {
+  background: #e4edff;
+  color: #164ba3;
 }
 
 .slice-box {
@@ -577,6 +604,10 @@ canvas.slice-preview {
 @media (max-width: 900px) {
   .sidebar,
   .review-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .slice-preview-grid {
     grid-template-columns: 1fr;
   }
 
