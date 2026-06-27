@@ -69,6 +69,9 @@ class LossCfg:
     smooth: float = 1.0e-3
     class_weights: Union[str, List[float]] = "inverse"
     ignore_index: int = -1
+    # Classes that actually carry target signal. If None, train() will default
+    # to background + particle classes (membrane excluded until enabled).
+    active_classes: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "LossCfg":
@@ -81,8 +84,18 @@ class TrainCfg:
     steps_per_epoch: int = 150
     batch_size: int = 8
     steps_per_valid: int = 20
-    n_workers: int = 4
+    # n_workers=0 avoids duplicating the in-RAM tomogram pool across forked
+    # workers (which would otherwise multiply resident memory by n_workers
+    # and cause OOM on Kaggle). Patches are already RAM-resident, so worker
+    # parallelism buys little here.
+    n_workers: int = 0
     pin_memory: bool = True
+    # Run the (slow) full-volume validation pass every N epochs. Full-volume
+    # inference slides over an entire tomogram and is much costlier than
+    # patch-level validation, so running it every epoch is wasteful. On
+    # in-between epochs, checkpoint selection falls back to patch-level F1.
+    # A value of 1 means "every epoch". The final epoch always runs it.
+    vol_eval_every: int = 10
     optimizer: str = "adamw"
     lr: float = 1.0e-4
     betas: tuple = (0.9, 0.999)

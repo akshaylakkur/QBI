@@ -1,4 +1,9 @@
-"""Optional: convert segmentations to particle coordinates (connected components)."""
+"""Optional: convert segmentations to particle coordinates (connected components).
+
+The stored segmentation carries *contiguous model-class indices* (see
+``labels.py``); this module converts them back to copick object names via
+``CLASS_TO_LABEL`` / ``CLASS_TO_NAME`` for writing picks.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ from scipy import ndimage
 from .settings import Config
 from .utils import get_logger
 from .data import copick_io
+from .labels import PARTICLE_CLASSES, CLASS_TO_NAME, CLASS_TO_LABEL
 
 
 def _remove_duplicates(coords: np.ndarray, threshold: float) -> np.ndarray:
@@ -69,6 +75,14 @@ def _write_copick_picks(name, tomo_id, coords, path_output, user_id, session_id)
         json.dump(data, f, indent=2)
 
 
+def _object_radius_voxels(config_path: str, object_name: str, voxel_size: float) -> float:
+    objs = {o["name"]: o for o in copick_io.get_pickable_objects(config_path)}
+    o = objs.get(object_name)
+    if not o or not o.get("radius"):
+        return 0.0
+    return float(o["radius"]) / float(voxel_size)
+
+
 def localize_segmentations(
     cfg: Config,
     tomo_ids: Optional[List[str]] = None,
@@ -76,8 +90,9 @@ def localize_segmentations(
 ) -> None:
     """Convert stored segmentations into particle coordinate picks.
 
-    NOTE: This is a secondary utility. The primary deliverable is the raw
-    segmentation labelmap written by `inference.run_inference`.
+    Iterates over *particle* model-class indices only (apo-ferritin=1 through
+    virus-like-particle=6), so apo-ferritin is no longer dropped. Background
+    (0) and membrane (7) are skipped automatically.
     """
     log = get_logger("localize")
     root = copick_io.get_copick_root(cfg.data.copick_config)
@@ -85,9 +100,6 @@ def localize_segmentations(
         tomo_ids = [r.name for r in root.runs]
 
     seg_name = segmentation_name or cfg.inference.segmentation_name
-    objects = {o["name"]: o for o in copick_io.get_pickable_objects(cfg.data.copick_config)}
-    label_to_name = {o["label"]: o["name"] for o in objects.values()}
-
     out_overlay = cfg.inference.out_overlay
     for tid in tomo_ids:
         log.info(f"Localizing {tid}")
@@ -100,14 +112,16 @@ def localize_segmentations(
             log.warning(f"  no segmentation '{seg_name}' for {tid}: {e}")
             continue
 
-        for label in range(2, cfg.model.n_class):
-            name = label_to_name.get(label)
-            if name is None or not objects[name]["is_particle"]:
+        # Iterate over the six particle classes (1..6).
+        for cls in PARTICLE_CLASSES:
+            name = CLASS_TO_NAME.get(cls)
+            if name is None:
                 continue
-            radius = objects[name]["radius"] or 0
-            r_vox = radius / cfg.data.voxel_size
+            r_vox = _object_radius_voxels(cfg.data.copick_config, name, cfg.data.voxel_size)
+            if r_vox <= 0:
+                continue
 
-            lbl_objs, _ = ndimage.label(labelmap == label)
+            lbl_objs, _ = ndimage.label(labelmap == cls)
             sizes = np.bincount(lbl_objs.ravel())
             min_size = (4 / 3) * np.pi * (r_vox ** 3) * cfg.localize.min_protein_size
             valid = np.where(sizes > min_size)[0]
@@ -122,7 +136,7 @@ def localize_segmentations(
             if not coords:
                 continue
             coords = np.array(coords, dtype=np.float32)
-            threshold = np.ceil(radius / (cfg.data.voxel_size * 3))
+            threshold = np.ceil(r_vox * 3)
             coords = _remove_duplicates(coords, threshold)
             # voxel -> angstrom
             coords[:, :3] *= cfg.data.voxel_size

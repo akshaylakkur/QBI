@@ -1,4 +1,11 @@
-"""Training loop for 3D CryoET segmentation (PyTorch, AMP, multi-GPU)."""
+"""Training loop for 3D CryoET segmentation (PyTorch, AMP, multi-GPU).
+
+Validation / model selection is driven by a *full-volume* sliding-window pass
+over a held-out tomogram (via ``segment_volume``), not patch-level F1 on random
+crops, so the chosen checkpoint reflects end-task segmentation quality. Only
+*active* classes (background + scored particles) participate in the macro-F1
+used for selection; dead heads (e.g. membrane when not trained) are excluded.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +13,7 @@ import os
 import math
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -14,7 +21,7 @@ from torch.utils.data import DataLoader
 
 try:
     from torch.utils.tensorboard import SummaryWriter
-except ImportError:  # tensorboard not installed
+except Exception:  # tensorboard optional; its import chain (TF/pyOpenSSL) can be broken on Kaggle
     SummaryWriter = None
 
 from .settings import Config
@@ -24,38 +31,42 @@ from .models import build_model
 from .losses import build_loss
 from .metrics import segmentation_metrics, MetricAccumulator
 from .data import copick_io, splits as split_utils
-from .data.dataset import CryoETPatchDataset, TomogramPool
+from .data.dataset import CryoETPatchDataset, TomogramPool, index_picks
 from .data.augment import Augment3D
+from .inference import segment_volume
+from .labels import ACTIVE_CLASSES, PARTICLE_CLASSES
 
 
-def _class_weight_vector(cfg: Config) -> Optional[list]:
-    """Build a class-weight vector from cfg.loss.class_weights."""
-    n = cfg.model.n_class
-    mode = cfg.loss.class_weights
-    if mode == "ones":
-        return [1.0] * n
-    if isinstance(mode, list):
-        return [float(x) for x in mode]
-    # "inverse" — derive from pick counts
-    # We approximate using object radii as proxies for class frequency rarity.
-    # The notebook used raw particle counts; here we use inverse-frequency of
-    # particle label occurrences in the train picks (computed lazily below).
-    return None  # handled in train() where picks are available
+def _active_classes_for(cfg: Config) -> List[int]:
+    """Classes that carry target signal (background + particles)."""
+    if cfg.loss.active_classes is not None:
+        return list(cfg.loss.active_classes)
+    return list(ACTIVE_CLASSES)
 
 
-def _inverse_freq_weights(picks, n_class) -> list:
+def _inverse_freq_weights(picks, n_class: int, active_classes: List[int]) -> list:
+    """Inverse-frequency class weights over ACTIVE classes only.
+
+    Inactive classes get zero weight so dead heads (e.g. membrane) don't pull
+    the model. Background (class 0) is down-weighted.
+    """
     counts = np.zeros(n_class, dtype=np.float64)
-    for *_p, label in picks:
-        counts[label] += 1
+    for *_p, cls in picks:
+        counts[cls] += 1
     counts[counts == 0] = 1.0
     w = 1.0 / counts
-    w = w / w.sum() * n_class  # normalize so mean weight = 1
-    # background (label 0 in our softmax indexing) gets a small weight
-    # NOTE: target labels in the dataset are 1..N (particle labels) plus 0 for
-    # background. We use class index 0 = background in the model output, so we
-    # must remap. For simplicity we keep label 0..n_class-1 aligned with target
-    # integer values (background=0, apo-ferritin=1, ...).
-    w[0] = 0.1 * (w[1:].mean() if n_class > 1 else 1.0)
+    # normalize over active classes so the mean active weight is 1.0
+    active = np.asarray(active_classes, dtype=np.int64)
+    w_active_mean = w[active].mean() if active.size else 1.0
+    w = w / max(w_active_mean, 1e-8)
+    # zero out inactive classes
+    mask = np.zeros(n_class, dtype=np.float64)
+    mask[active] = 1.0
+    w = w * mask
+    # down-weight background relative to the mean particle weight
+    if 0 in active:
+        particle_w = w[[c for c in active if c != 0]]
+        w[0] = 0.1 * (particle_w.mean() if particle_w.size else 1.0)
     return w.tolist()
 
 
@@ -99,6 +110,54 @@ def _warmup_lr(optimizer, step, warmup_steps, base_lr):
         pg["lr"] = lr
 
 
+def _unwrap(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+@torch.no_grad()
+def full_volume_metrics(
+    model, cfg, tomo_id, active_classes, device, log
+) -> dict:
+    """Run sliding-window inference on one full tomogram and score it against
+    the stored target. Returns per-class + macro F1/IoU over active classes.
+
+    This is a more honest checkpoint-selection signal than patch-level F1 on
+    random crops, because it measures end-to-end segmentation quality on a
+    realistic volume.
+    """
+    tomo = copick_io.get_tomogram(
+        cfg.data.copick_config, tomo_id, cfg.data.voxel_size, cfg.data.tomo_algorithm
+    )[:]
+    try:
+        tgt = copick_io.get_segmentation(
+            cfg.data.copick_config, tomo_id,
+            name=cfg.data.target_name,
+            user_id=cfg.data.target_user_id,
+            session_id=cfg.data.target_session_id,
+        )[:]
+    except Exception as e:
+        log.warning(f"  no target for {tomo_id}: {e}; skipping full-volume eval")
+        return {"macro_f1": 0.0, "macro_iou": 0.0}
+
+    labelmap, _ = segment_volume(
+        _unwrap(model), tomo,
+        patch_size=cfg.inference.patch_size,
+        overlap=cfg.inference.overlap,
+        pcrop=cfg.inference.pcrop,
+        n_class=cfg.model.n_class,
+        batch_patches=cfg.inference.batch_patches,
+        amp=cfg.inference.amp,
+        device=device,
+    )
+    pred = torch.from_numpy(labelmap.astype(np.int64))[None].to(device)       # (1,Z,Y,X)
+    target = torch.from_numpy(tgt.astype(np.int64))[None].to(device)           # (1,Z,Y,X)
+    # segmentation_metrics expects logits (B,C,D,H,W) and target (B,D,H,W).
+    onehot = torch.nn.functional.one_hot(pred, cfg.model.n_class).permute(0, 4, 1, 2, 3)  # (1,C,Z,Y,X)
+    onehot = onehot.float() * 20.0  # large logits so argmax == pred
+    m = segmentation_metrics(onehot, target, cfg.model.n_class, cfg.loss.ignore_index, active_classes)
+    return m
+
+
 def train(cfg: Config) -> str:
     """Run training. Returns path to the best checkpoint."""
     log = get_logger("train")
@@ -123,19 +182,20 @@ def train(cfg: Config) -> str:
             all_runs, cfg.data.train_ratio, cfg.data.val_ratio, cfg.data.test_ratio,
             seed=cfg.train.seed,
         )
-        # ensure validation set is at least as large as test (per DeepFindET)
         if len(_test) > len(valid_ids):
             valid_ids, _test = _test, valid_ids
     log.info(f"Train tomos ({len(train_ids)}): {train_ids}")
     log.info(f"Valid tomos ({len(valid_ids)}): {valid_ids}")
 
-    # ---- Class weights ------------------------------------------------
-    # index_picks is defined earlier in the notebook global namespace.
+    # ---- Active classes + class weights ------------------------------
+    active_classes = _active_classes_for(cfg)
+    log.info(f"Active classes (loss/metric): {active_classes}")
+    cfg.loss.active_classes = active_classes
+
     train_picks = index_picks(cfg.data.copick_config, train_ids, None, cfg.data.voxel_size)
     if cfg.loss.class_weights == "inverse":
-        weights = _inverse_freq_weights(train_picks, cfg.model.n_class)
-        log.info(f"Class weights (inverse-freq): {[round(w,4) for w in weights]}")
-        # inject into loss cfg
+        weights = _inverse_freq_weights(train_picks, cfg.model.n_class, active_classes)
+        log.info(f"Class weights (inverse-freq, active-only): {[round(w,4) for w in weights]}")
         cfg.loss.class_weights = weights
 
     # ---- Model / loss / optim ----------------------------------------
@@ -147,7 +207,7 @@ def train(cfg: Config) -> str:
     if n_gpu > 1:
         model = torch.nn.DataParallel(model)
     model = model.to(device)
-    criterion = build_loss(cfg.loss).to(device)
+    criterion = build_loss(cfg.loss, n_class=cfg.model.n_class).to(device)
     optimizer = _build_optimizer(cfg, model)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.train.amp and device.type == "cuda")
     scheduler = _build_scheduler(cfg, optimizer, cfg.train.steps_per_epoch)
@@ -155,10 +215,7 @@ def train(cfg: Config) -> str:
     start_epoch = 0
     best_f1 = -1.0
 
-    # ---- Resume logic (train resume purposes) ----
-    # Priority: explicit cfg.train.resume > BEST > LAST > from scratch.
-    # When resuming we restore model + optimizer + scheduler + scaler + epoch +
-    # best_metric so training continues seamlessly from where it left off.
+    # ---- Resume logic ----
     resume_path = cfg.train.resume
     if resume_path is None:
         best_path = out_dir / "net_weights_BEST.pt"
@@ -172,7 +229,7 @@ def train(cfg: Config) -> str:
 
     if resume_path is not None and Path(resume_path).exists():
         ckpt = load_checkpoint(resume_path, model, optimizer, scheduler, scaler, map_location=device)
-        start_epoch = int(ckpt.get("epoch", 0)) + 1  # continue from the NEXT epoch
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_f1 = float(ckpt.get("best_metric") or -1.0)
         log.info(f"Resumed from {resume_path} -> start_epoch={start_epoch} best_f1={best_f1:.4f}")
     elif resume_path is not None:
@@ -192,6 +249,8 @@ def train(cfg: Config) -> str:
         n_sub_epoch=cfg.data.n_sub_epoch, sample_size=cfg.data.sample_size,
         seed=cfg.train.seed,
     )
+    # Patch-level validation loader is kept for a quick per-epoch sanity loss,
+    # but checkpoint selection uses the full-volume pass below.
     valid_ds = CryoETPatchDataset(
         cfg.data.copick_config, valid_ids, cfg.data.dim_in, cfg.train.batch_size,
         steps=cfg.train.steps_per_valid, l_rnd=cfg.data.l_rnd,
@@ -210,11 +269,14 @@ def train(cfg: Config) -> str:
             worker_init_fn=lambda wid: None,
         )
 
-    # ---- TensorBoard --------------------------------------------------
-    writer = SummaryWriter(log_dir=str(out_dir / "tensorboard_logs")) if SummaryWriter else None
-    history = {"train_loss": [], "val_loss": [], "val_macro_f1": [], "val_macro_iou": [], "lr": []}
+    # Held-out tomogram for full-volume model selection.
+    vol_eval_id = valid_ids[0] if valid_ids else (train_ids[0] if train_ids else None)
 
-    # ---- Training loop ------------------------------------------------
+    # ---- TensorBoard / history ----------------------------------------
+    writer = SummaryWriter(log_dir=str(out_dir / "tensorboard_logs")) if SummaryWriter else None
+    history = {"train_loss": [], "val_loss": [], "val_macro_f1": [], "val_macro_iou": [],
+               "vol_macro_f1": [], "lr": []}
+
     warmup_steps = cfg.train.warmup_epochs * cfg.train.steps_per_epoch
     global_step = start_epoch * cfg.train.steps_per_epoch
 
@@ -249,9 +311,9 @@ def train(cfg: Config) -> str:
 
         train_loss = running_loss / max(1, cfg.train.steps_per_epoch)
 
-        # ---- Validation ----
+        # ---- Quick patch-level validation loss (sanity) ----
         model.eval()
-        acc = MetricAccumulator(cfg.model.n_class)
+        acc = MetricAccumulator(cfg.model.n_class, active_classes)
         with torch.no_grad():
             for img, lbl in _loader(valid_ds):
                 img = img.to(device, non_blocking=True)
@@ -259,74 +321,49 @@ def train(cfg: Config) -> str:
                 with torch.amp.autocast("cuda", enabled=cfg.train.amp and device.type == "cuda"):
                     out = model(img)
                     loss = criterion(out, lbl)
-                m = segmentation_metrics(out.float(), lbl, cfg.model.n_class, cfg.loss.ignore_index)
+                m = segmentation_metrics(out.float(), lbl, cfg.model.n_class, cfg.loss.ignore_index, active_classes)
                 acc.update(m, float(loss.item()))
         vm = acc.compute()
-        log.info(
-            f"[Epoch {epoch}] train_loss={train_loss:.4f} valid_loss={vm['loss']:.4f} "
-            f"macroF1={vm['macro_f1']:.4f} mIoU={vm['macro_iou']:.4f} "
-            f"perF1={[round(float(x),3) for x in vm['f1']]} ({time.time()-t0:.0f}s)"
+
+        # ---- Full-volume validation (drives checkpoint selection) ----
+        # Full-volume inference slides over an entire tomogram and is much
+        # costlier than patch-level validation. Run it every `vol_eval_every`
+        # epochs (and on the final epoch); on other epochs fall back to patch
+        # F1 so checkpoint selection still works.
+        is_last_epoch = (epoch == cfg.train.epochs - 1)
+        do_vol_eval = (vol_eval_id is not None) and (
+            (epoch + 1) % max(1, cfg.train.vol_eval_every) == 0 or is_last_epoch
         )
-
-        # ---- Per-epoch side-by-side visualization (tomogram | GT | prediction) ----
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            # grab one validation patch (already yielded by the iterable dataset)
-            viz_img, viz_lbl = None, None
-            for vi, vl in _loader(valid_ds):
-                viz_img, viz_lbl = vi[0:1], vl[0:1]
-                break
-            if viz_img is not None:
-                viz_img = viz_img.to(device, non_blocking=True)
-                with torch.amp.autocast("cuda", enabled=cfg.train.amp and device.type == "cuda"):
-                    viz_out = model(viz_img)
-                viz_img = viz_img[0, 0].detach().cpu().numpy()        # (D,D,D)
-                viz_lbl_np = viz_lbl[0].detach().cpu().numpy()       # (D,D,D)
-                viz_pred = viz_out[0].argmax(0).detach().cpu().numpy()  # (D,D,D) argmax over class axis
-                # mid-slice
-                dz = viz_img.shape[0] // 2
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                axes[0].imshow(viz_img[dz], cmap="gray")
-                axes[0].set_title(f"tomogram z={dz}"); axes[0].axis("off")
-                # use inlined overlay helpers if present, else plain imshow
-                if "overlay_slice" in globals() and "legend_for_labels" in globals():
-                    overlay_slice(viz_img[dz], viz_lbl_np[dz], alpha=0.55, ax=axes[1],
-                                  title=f"GROUND TRUTH z={dz} (epoch {epoch})")
-                    legend_for_labels(np.unique(viz_lbl_np[dz]), ax=axes[1])
-                    overlay_slice(viz_img[dz], viz_pred[dz], alpha=0.55, ax=axes[2],
-                                  title=f"PREDICTION z={dz} (epoch {epoch})")
-                    legend_for_labels(np.unique(viz_pred[dz]), ax=axes[2])
-                else:
-                    from matplotlib.colors import ListedColormap, BoundaryNorm
-                    from matplotlib.patches import Patch
-                    cmap = ListedColormap([[0,0,0,0],[0,0.46,0.86,0.8],[0.6,0.25,0,0.8],
-                                           [0.3,0,0.36,0.8],[0,0.36,0.19,0.8],[0.17,0.81,0.28,0.8],
-                                           [1,0.8,0.6,0.8],[1,1,1,0.8]])
-                    for a, vol, name in [(axes[1], viz_lbl_np, "GROUND TRUTH"),
-                                         (axes[2], viz_pred, "PREDICTION")]:
-                        a.imshow(viz_img[dz], cmap="gray")
-                        lp = np.unique(vol[dz]); lp = lp[lp > 0]
-                        if len(lp):
-                            bounds = np.array(list(lp)+[lp[-1]+1], dtype=float) - 0.5
-                            a.imshow(vol[dz], cmap=cmap, norm=BoundaryNorm(bounds, cmap.N), alpha=0.55)
-                        a.set_title(f"{name} z={dz} (epoch {epoch})"); a.axis("off")
-                fig.suptitle(f"Epoch {epoch} — val macroF1={vm['macro_f1']:.3f}", fontsize=12)
-                plt.tight_layout()
-                viz_dir = out_dir / "viz"
-                viz_dir.mkdir(parents=True, exist_ok=True)
-                fig.savefig(viz_dir / f"epoch_{epoch:03d}.png", dpi=90, bbox_inches="tight")
-                plt.show()
-                plt.close(fig)
-        except Exception as _viz_err:
-            log.info(f"(per-epoch viz skipped: {_viz_err})")
+        vol_f1 = vm["macro_f1"]
+        vol_iou = vm["macro_iou"]
+        if do_vol_eval:
+            try:
+                vm_vol = full_volume_metrics(model, cfg, vol_eval_id, active_classes, device, log)
+                vol_f1 = vm_vol["macro_f1"]
+                vol_iou = vm_vol["macro_iou"]
+                log.info(
+                    f"[Epoch {epoch}] train_loss={train_loss:.4f} patch_loss={vm['loss']:.4f} "
+                    f"patchF1={vm['macro_f1']:.4f} | VOLUME macroF1={vol_f1:.4f} "
+                    f"mIoU={vol_iou:.4f} ({time.time()-t0:.0f}s)"
+                )
+            except Exception as e:
+                log.warning(f"  full-volume eval failed: {e}; falling back to patch F1")
+                log.info(
+                    f"[Epoch {epoch}] train_loss={train_loss:.4f} val_loss={vm['loss']:.4f} "
+                    f"macroF1={vm['macro_f1']:.4f} mIoU={vm['macro_iou']:.4f} ({time.time()-t0:.0f}s)"
+                )
+        else:
+            log.info(
+                f"[Epoch {epoch}] train_loss={train_loss:.4f} val_loss={vm['loss']:.4f} "
+                f"macroF1={vm['macro_f1']:.4f} mIoU={vm['macro_iou']:.4f} "
+                f"(patch-only; full-vol eval every {cfg.train.vol_eval_every} eps) "
+                f"({time.time()-t0:.0f}s)"
+            )
 
         # ---- LR schedule ----
         if scheduler is not None:
             if cfg.train.scheduler == "plateau":
-                scheduler.step(vm["macro_f1"])
+                scheduler.step(vol_f1)
             else:
                 scheduler.step()
 
@@ -335,36 +372,39 @@ def train(cfg: Config) -> str:
         history["val_loss"].append(vm["loss"])
         history["val_macro_f1"].append(vm["macro_f1"])
         history["val_macro_iou"].append(vm["macro_iou"])
+        history["vol_macro_f1"].append(vol_f1)
         history["lr"].append(optimizer.param_groups[0]["lr"])
         import json as _json
         _json.dump(history, open(out_dir / "history.json", "w"))
 
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, epoch)
-            writer.add_scalar("valid/loss", vm["loss"], epoch)
-            writer.add_scalar("valid/macro_f1", vm["macro_f1"], epoch)
-            writer.add_scalar("valid/macro_iou", vm["macro_iou"], epoch)
+            writer.add_scalar("valid/patch_loss", vm["loss"], epoch)
+            writer.add_scalar("valid/patch_macro_f1", vm["macro_f1"], epoch)
+            writer.add_scalar("valid/volume_macro_f1", vol_f1, epoch)
+            writer.add_scalar("valid/volume_macro_iou", vol_iou, epoch)
             writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
-            for c in range(cfg.model.n_class):
+            for c in active_classes:
                 writer.add_scalar(f"valid/f1_class{c}", vm["f1"][c], epoch)
 
         ckpt_path = out_dir / "net_weights_LAST.pt"
-        save_checkpoint(str(ckpt_path), model.module if isinstance(model, torch.nn.DataParallel) else model,
+        save_checkpoint(str(ckpt_path), _unwrap(model),
                         optimizer, scheduler, scaler, epoch, best_f1)
 
-        if vm["macro_f1"] > best_f1:
-            best_f1 = vm["macro_f1"]
+        # Select BEST on the full-volume macro-F1 (the end-task signal).
+        if vol_f1 > best_f1:
+            best_f1 = vol_f1
             best_path = out_dir / "net_weights_BEST.pt"
-            save_checkpoint(str(best_path), model.module if isinstance(model, torch.nn.DataParallel) else model,
+            save_checkpoint(str(best_path), _unwrap(model),
                             optimizer, scheduler, scaler, epoch, best_f1)
-            log.info(f"  -> new best macroF1={best_f1:.4f} saved to {best_path}")
+            log.info(f"  -> new best volume macroF1={best_f1:.4f} saved to {best_path}")
 
         if (epoch + 1) % max(1, cfg.train.save_every) == 0:
             ep_path = out_dir / f"net_weights_epoch{epoch+1}.pt"
-            save_checkpoint(str(ep_path), model.module if isinstance(model, torch.nn.DataParallel) else model,
+            save_checkpoint(str(ep_path), _unwrap(model),
                             optimizer, scheduler, scaler, epoch, best_f1)
 
     if writer is not None:
         writer.close()
-    log.info(f"Training complete. best macroF1={best_f1:.4f}")
+    log.info(f"Training complete. best volume macroF1={best_f1:.4f}")
     return str(out_dir / "net_weights_BEST.pt")

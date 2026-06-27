@@ -1,4 +1,10 @@
-"""3D building blocks: conv blocks, residual blocks, attention blocks."""
+"""3D building blocks: conv blocks, residual blocks, attention blocks.
+
+Normalization uses GroupNorm (not BatchNorm) so training is stable at the small
+per-GPU batches typical of 3D segmentation (e.g. 4/GPU on 2x T4 with DataParallel).
+GroupNorm is independent of batch size and avoids running-stat drift between
+train and eval.
+"""
 
 from __future__ import annotations
 
@@ -6,17 +12,26 @@ import torch
 import torch.nn as nn
 
 
+def _norm(channels: int, groups: int = 8) -> nn.Module:
+    """GroupNorm with at most `groups` groups (clamped to channel count)."""
+    g = min(groups, channels)
+    # ensure groups divides channels; if not, fall back to a divisor
+    while channels % g != 0 and g > 1:
+        g -= 1
+    return nn.GroupNorm(g, channels)
+
+
 class ConvBlock(nn.Module):
-    """Two 3x3x3 convs with BN + LeakyReLU."""
+    """Two 3x3x3 convs with GroupNorm + LeakyReLU."""
 
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
         layers = [
             nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm3d(out_ch),
+            _norm(out_ch),
             nn.LeakyReLU(inplace=True),
             nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm3d(out_ch),
+            _norm(out_ch),
             nn.LeakyReLU(inplace=True),
         ]
         if dropout and dropout > 0:
@@ -28,14 +43,17 @@ class ConvBlock(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Residual conv block with 1x1x1 shortcut when channels differ."""
+    """Residual conv block with 1x1x1 shortcut when channels differ.
+
+    Uses GroupNorm instead of BatchNorm for stability at small per-GPU batches.
+    """
 
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
         self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_ch)
+        self.bn1 = _norm(out_ch)
         self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_ch)
+        self.bn2 = _norm(out_ch)
         self.act = nn.LeakyReLU(inplace=True)
         self.shortcut = (
             nn.Conv3d(in_ch, out_ch, 1, bias=False)
