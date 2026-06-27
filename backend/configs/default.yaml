@@ -1,0 +1,116 @@
+# =========================================================================
+# Default config for PyTorch-native CryoET 3D segmentation
+# =========================================================================
+# All paths can be overridden via CLI or a custom yaml passed to --config.
+
+# ---- Data ---------------------------------------------------------------
+data:
+  # Path to the copick config file (created by scripts/setup_copick.py)
+  copick_config: "/kaggle/working/copick.config"
+  # Root of the read-only competition input
+  input_root: "/kaggle/input/competitions/czii-cryo-et-object-identification"
+  # Writable output root
+  output_root: "/kaggle/working"
+
+  voxel_size: 10            # Angstrom per voxel
+  tomo_algorithm: "denoised"
+  tomo_type: "denoised"
+
+  # Where segmentation targets (spheres) are stored within the overlay
+  target_name: "pytargets"
+  target_user_id: "pytorch"
+  target_session_id: "0"
+
+  # Patch size in voxels (must be multiple of 4 due to two pooling stages)
+  dim_in: 72
+  # Random shift applied to patch centers (in voxels)
+  l_rnd: 15
+  # Fraction of a batch drawn from background (non-particle) locations
+  background_ratio: 0.30
+
+  # How many tomograms to keep resident in memory at once
+  sample_size: 5
+  # Number of epochs to train on a tomogram subset before swapping
+  n_sub_epoch: 10
+
+  # Train/val/test split ratios (only used if explicit IDs not given)
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# ---- Model --------------------------------------------------------------
+model:
+  name: "res_unet"          # res_unet | unet | attention_unet
+  filters: [48, 64, 128]
+  dropout: 0.0
+  # in_channels must match data.tomo_type count when multi-tomo input used
+  in_channels: 1
+  # Number of segmentation classes (background + 6 particles + membrane)
+  n_class: 8
+
+# ---- Loss ---------------------------------------------------------------
+loss:
+  type: "ce_tversky"        # ce_tversky | tversky | focal_tversky | dice | ce
+  alpha: 0.3                # false-positive weight (Tversky)
+  beta: 0.7                 # false-negative weight (Tversky)
+  gamma: 2.0                # focal exponent (focal_tversky)
+  ce_weight: 1.0
+  tversky_weight: 1.0
+  smooth: 1.0e-3
+  # class_weights: "inverse" | "ones" | explicit list length n_class
+  class_weights: "inverse"
+  ignore_index: -1
+
+# ---- Training -----------------------------------------------------------
+train:
+  epochs: 70
+  steps_per_epoch: 150
+  batch_size: 8             # per-GPU
+  steps_per_valid: 20
+  n_workers: 4
+  pin_memory: true
+
+  optimizer: "adamw"
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+
+  scheduler: "cosine"        # cosine | plateau | none
+  warmup_epochs: 3
+  min_lr: 1.0e-6
+
+  amp: true                  # mixed precision (recommended on T4)
+
+  grad_clip: 0.0             # 0 = off
+
+  # Checkpointing
+  out_dir: "/kaggle/working/train_results"
+  save_every: 10
+  resume: null               # path to a .pt to resume from
+
+  seed: 42
+
+# ---- Inference ----------------------------------------------------------
+inference:
+  patch_size: 72
+  overlap: 55                # pixels; effective stride = patch_size - overlap
+  pcrop: 25                  # border crop per side
+  batch_patches: 4           # number of patches per forward pass
+  amp: true
+  # If true, also write the full per-class probability scoremap (large)
+  write_scoremap: false
+  scoremap_name: "pyscoremap"
+  segmentation_name: "pysegmentation"
+  user_id: "pytorch"
+  session_id: "0"
+  out_overlay: "/kaggle/working/predictions"
+
+# ---- Localization (optional, secondary) ---------------------------------
+localize:
+  min_protein_size: 0.8
+  write_copick_picks: true
+  write_csv: false
+  csv_path: "/kaggle/working/submission.csv"
+  picks_user_id: "pytorch"
+  picks_session_id: "0"
