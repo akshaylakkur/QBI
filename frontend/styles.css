@@ -110,6 +110,42 @@ h2 {
   padding: 0;
 }
 
+.slice-slider-stack {
+  width: clamp(220px, 27vw, 360px);
+  display: grid;
+  gap: 6px;
+}
+
+.slice-slider-control {
+  width: 100%;
+  min-height: 30px;
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.slice-slider-control span {
+  min-width: 36px;
+  color: var(--ink);
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.slice-slider-control input {
+  min-width: 0;
+}
+
+.slice-slider-control.is-active {
+  border-color: var(--teal);
+  background: #eefafa;
+}
+
 .workspace {
   width: min(1580px, 100%);
   margin: 0 auto;
@@ -234,6 +270,22 @@ select {
   padding: 0 10px;
   background: #ffffff;
   color: var(--ink);
+}
+
+.inline-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.inline-field button {
+  min-height: 40px;
+  border: 1px solid var(--teal);
+  border-radius: 7px;
+  padding: 0 12px;
+  background: var(--teal);
+  color: #ffffff;
+  font-weight: 800;
 }
 
 input[type="range"] {
@@ -561,10 +613,16 @@ canvas.slice-preview {
   .tool-buttons {
     width: 100%;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: 40px 1fr 40px 40px;
+    align-items: center;
   }
 
   .tool-buttons button {
+    width: 100%;
+  }
+
+  .slice-slider-stack,
+  .slice-slider-control {
     width: 100%;
   }
 }

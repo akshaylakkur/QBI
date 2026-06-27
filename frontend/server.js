@@ -2,12 +2,16 @@ const http = require("node:http");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const os = require("node:os");
+const { spawn } = require("node:child_process");
 
 const port = Number.parseInt(process.env.PORT || "3000", 10);
 const publicDir = __dirname;
 const sampleDir = path.join(__dirname, "sample_data");
 const uploadsDir = path.join(__dirname, "uploaded_scans");
+const slicerExportDir = path.join(os.tmpdir(), "qbi-slicer-exports");
 const volumeCache = new Map();
+const localScans = new Map();
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -36,10 +40,20 @@ function sendJson(res, statusCode, body) {
   send(res, statusCode, JSON.stringify(body), "application/json; charset=utf-8");
 }
 
-function sendBuffer(res, statusCode, body, contentType = "application/octet-stream") {
+function sendBuffer(res, statusCode, body, contentType = "application/octet-stream", extraHeaders = {}) {
   res.writeHead(statusCode, {
     "Content-Type": contentType,
-    "Content-Length": body.length
+    "Content-Length": body.length,
+    ...extraHeaders
+  });
+  res.end(body);
+}
+
+function sendDownload(res, body, filename, contentType = "application/octet-stream") {
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": body.length,
+    "Content-Disposition": `attachment; filename="${filename}"`
   });
   res.end(body);
 }
@@ -62,6 +76,10 @@ function safeSegment(value) {
 }
 
 function resolveScanPath(scanPath) {
+  if (scanPath?.startsWith("local:")) {
+    return localScans.get(scanPath) || null;
+  }
+
   const decoded = decodeURIComponent(scanPath || "");
   const normalized = path.normalize(decoded).replace(/^(\.\.[/\\])+/, "");
   const filePath = path.join(__dirname, normalized);
@@ -72,6 +90,62 @@ function resolveScanPath(scanPath) {
   }
 
   return filePath;
+}
+
+async function readRequestJson(req) {
+  const chunks = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    chunks.push(chunk);
+    total += chunk.length;
+    if (total > 1_000_000) {
+      throw new Error("Request body too large");
+    }
+  }
+
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+async function listZarrLevels(zarrPath) {
+  let entries = [];
+  try {
+    entries = await fsp.readdir(zarrPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const levels = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const metadataPath = path.join(zarrPath, entry.name, ".zarray");
+    if (fs.existsSync(metadataPath)) {
+      levels.push(entry.name);
+    }
+  }
+
+  return levels.sort((a, b) => {
+    const numericA = Number(a);
+    const numericB = Number(b);
+    if (Number.isFinite(numericA) && Number.isFinite(numericB)) {
+      return numericB - numericA;
+    }
+    return b.localeCompare(a);
+  });
+}
+
+function scanPayload(id, name, scanPath, levels) {
+  return {
+    id,
+    name,
+    path: id,
+    levels,
+    defaultLevel: levels[0] || "0",
+    metadataMissing: levels.length === 0
+  };
 }
 
 async function findZarrs(rootDir, baseLabel) {
@@ -94,11 +168,7 @@ async function findZarrs(rootDir, baseLabel) {
 
     if (dir.endsWith(".zarr") || hasZgroup || hasZarrJson) {
       const relativePath = path.relative(__dirname, dir);
-      results.push({
-        id: relativePath,
-        name: `${baseLabel}: ${path.basename(dir)}`,
-        path: relativePath
-      });
+      results.push(scanPayload(relativePath, `${baseLabel}: ${path.basename(dir)}`, dir, await listZarrLevels(dir)));
       return;
     }
 
@@ -224,12 +294,21 @@ async function decodeBloscChunk(chunkPath) {
 }
 
 async function loadVolumePreview(zarrPath, levelName = "2") {
-  const cacheKey = `${zarrPath}:${levelName}`;
+  let resolvedLevel = levelName;
+  if (!fs.existsSync(path.join(zarrPath, resolvedLevel, ".zarray"))) {
+    const levels = await listZarrLevels(zarrPath);
+    if (levels.length === 0) {
+      throw new Error(`No Zarr array metadata found in ${path.basename(zarrPath)}. The folder must include hidden metadata files such as .zarray/.zattrs or zarr.json; browser folder upload may omit these dotfiles. Use "Open local .zarr path" instead.`);
+    }
+    resolvedLevel = levels.includes(levelName) ? levelName : levels[0];
+  }
+
+  const cacheKey = `${zarrPath}:${resolvedLevel}`;
   if (volumeCache.has(cacheKey)) {
     return volumeCache.get(cacheKey);
   }
 
-  const arrayPath = path.join(zarrPath, levelName);
+  const arrayPath = path.join(zarrPath, resolvedLevel);
   const metadata = await readJson(path.join(arrayPath, ".zarray"));
   const [depth, height, width] = metadata.shape;
   const [chunkDepth, chunkHeight, chunkWidth] = metadata.chunks;
@@ -260,6 +339,7 @@ async function loadVolumePreview(zarrPath, levelName = "2") {
   }
 
   const volume = {
+    level: resolvedLevel,
     metadata,
     data: new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4),
     shape: { z: depth, y: height, x: width }
@@ -309,9 +389,120 @@ function buildPointCloud(volume, requestedStride = 2, requestedLimit = 38000) {
       Number(((point.x / Math.max(1, shape.x - 1)) - 0.5).toFixed(5)),
       Number(((point.y / Math.max(1, shape.y - 1)) - 0.5).toFixed(5)),
       Number(((point.z / Math.max(1, shape.z - 1)) - 0.5).toFixed(5)),
-      Number((point.score / scoreMax).toFixed(5))
+      Number((point.score / scoreMax).toFixed(5)),
+      Number(Math.max(0, Math.min(1, (point.value - low) / spread)).toFixed(5))
     ])
   };
+}
+
+function buildNrrdVolume(volume) {
+  const { data, shape } = volume;
+  const values = [];
+
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    if (Number.isFinite(value) && Math.abs(value) <= 1_000_000) {
+      values.push(value);
+    }
+  }
+
+  values.sort((a, b) => a - b);
+  const low = values[Math.floor(values.length * 0.01)] || 0;
+  const high = values[Math.floor(values.length * 0.99)] || 1;
+  const range = high - low || 1;
+  const voxels = Buffer.alloc(shape.x * shape.y * shape.z);
+
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    const safeValue = Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : low;
+    voxels[index] = Math.max(0, Math.min(255, Math.round(((safeValue - low) / range) * 255)));
+  }
+
+  const header = [
+    "NRRD0005",
+    "# QBI export for 3D Slicer",
+    "type: uchar",
+    "dimension: 3",
+    "space: left-posterior-superior",
+    `sizes: ${shape.x} ${shape.y} ${shape.z}`,
+    "space directions: (1,0,0) (0,1,0) (0,0,1)",
+    "kinds: domain domain domain",
+    "encoding: raw",
+    "endian: little",
+    "space origin: (0,0,0)",
+    "",
+    ""
+  ].join("\n");
+
+  return Buffer.concat([Buffer.from(header, "ascii"), voxels]);
+}
+
+function slicerExportName(scanPath, level) {
+  const scanName = safeSegment(path.basename(scanPath || "scan").replace(/\.zarr$/i, ""));
+  return `${scanName}-level-${safeSegment(level)}.nrrd`;
+}
+
+async function writeSlicerExport(zarrPath, level) {
+  const volume = await loadVolumePreview(zarrPath, level);
+  const filename = slicerExportName(zarrPath, level);
+  const body = buildNrrdVolume(volume);
+  await fsp.mkdir(slicerExportDir, { recursive: true });
+  const filePath = path.join(slicerExportDir, filename);
+  await fsp.writeFile(filePath, body);
+  return { body, filename, filePath };
+}
+
+async function findSlicerExecutable() {
+  if (process.env.SLICER_PATH && fs.existsSync(process.env.SLICER_PATH)) {
+    return process.env.SLICER_PATH;
+  }
+
+  if (process.platform === "darwin") {
+    const roots = ["/Applications", path.join(os.homedir(), "Applications")];
+    for (const root of roots) {
+      let entries = [];
+      try {
+        entries = await fsp.readdir(root);
+      } catch {
+        continue;
+      }
+
+      const appName = entries.find((entry) => /^Slicer.*\.app$/i.test(entry));
+      if (appName) {
+        const executable = path.join(root, appName, "Contents", "MacOS", "Slicer");
+        if (fs.existsSync(executable)) {
+          return executable;
+        }
+      }
+    }
+  }
+
+  const candidates = process.platform === "win32"
+    ? [
+        "C:\\Program Files\\Slicer 5.12.0\\Slicer.exe",
+        "C:\\Program Files\\Slicer\\Slicer.exe"
+      ]
+    : [
+        "/usr/local/bin/Slicer",
+        "/usr/bin/Slicer",
+        "/opt/Slicer/Slicer"
+      ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+async function openInSlicer(filePath) {
+  const slicerExecutable = await findSlicerExecutable();
+  if (!slicerExecutable) {
+    return false;
+  }
+
+  const child = spawn(slicerExecutable, [filePath], {
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+  return true;
 }
 
 function buildDetections(volume) {
@@ -355,7 +546,31 @@ async function handleApi(req, res) {
       findZarrs(sampleDir, "Sample"),
       findZarrs(uploadsDir, "Uploaded")
     ]);
-    sendJson(res, 200, { scans: [...sampleScans, ...uploadedScans] });
+    const localScanList = await Promise.all(
+      [...localScans.entries()].map(async ([id, scanPath]) => scanPayload(id, `Local: ${path.basename(scanPath)}`, scanPath, await listZarrLevels(scanPath)))
+    );
+    sendJson(res, 200, { scans: [...sampleScans, ...uploadedScans, ...localScanList] });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/local-zarr") {
+    const body = await readRequestJson(req);
+    const requestedPath = path.resolve(String(body.path || ""));
+    const stats = await fsp.stat(requestedPath).catch(() => null);
+    if (!stats?.isDirectory()) {
+      sendJson(res, 400, { error: "Local path must point to an existing .zarr directory" });
+      return;
+    }
+
+    const levels = await listZarrLevels(requestedPath);
+    if (levels.length === 0) {
+      sendJson(res, 400, { error: "No .zarray metadata files were found in that .zarr directory" });
+      return;
+    }
+
+    const id = `local:${Buffer.from(requestedPath).toString("base64url")}`;
+    localScans.set(id, requestedPath);
+    sendJson(res, 200, { scan: scanPayload(id, `Local: ${path.basename(requestedPath)}`, requestedPath, levels) });
     return;
   }
 
@@ -390,7 +605,8 @@ async function handleApi(req, res) {
     const limit = Number.parseInt(url.searchParams.get("limit") || "38000", 10);
     const volume = await loadVolumePreview(zarrPath, level);
     sendJson(res, 200, {
-      level,
+      level: volume.level,
+      levels: await listZarrLevels(zarrPath),
       ...buildPointCloud(volume, stride, limit),
       detections: buildDetections(volume)
     });
@@ -404,15 +620,44 @@ async function handleApi(req, res) {
       return;
     }
 
+    const axis = ["x", "y", "z"].includes(url.searchParams.get("axis")) ? url.searchParams.get("axis") : "z";
     const level = url.searchParams.get("level") || "2";
+    const sourceLevel = url.searchParams.get("sourceLevel") || level;
+    const sourceIndex = Number.parseInt(url.searchParams.get("index") || url.searchParams.get(axis) || url.searchParams.get("z") || "0", 10);
+    let sourceShape = null;
+
+    if (sourceLevel !== level) {
+      sourceShape = (await loadVolumePreview(zarrPath, sourceLevel)).shape;
+    }
+
     const volume = await loadVolumePreview(zarrPath, level);
-    const z = Math.max(0, Math.min(volume.shape.z - 1, Number.parseInt(url.searchParams.get("z") || `${Math.floor(volume.shape.z / 2)}`, 10)));
-    const pixels = Buffer.alloc(volume.shape.x * volume.shape.y);
+    const axisSize = volume.shape[axis];
+    const sourceAxisSize = sourceShape?.[axis] || axisSize;
+    const mappedIndex = sourceShape
+      ? Math.round((Math.max(0, Math.min(sourceAxisSize - 1, sourceIndex)) / Math.max(1, sourceAxisSize - 1)) * (axisSize - 1))
+      : sourceIndex;
+    const sliceIndex = Math.max(0, Math.min(axisSize - 1, Number.isFinite(mappedIndex) ? mappedIndex : Math.floor(axisSize / 2)));
+    const sourceWidth = axis === "x" ? volume.shape.y : volume.shape.x;
+    const sourceHeight = axis === "z" ? volume.shape.y : volume.shape.z;
+    const maxSize = Math.max(64, Math.min(1024, Number.parseInt(url.searchParams.get("maxSize") || "0", 10) || Math.max(sourceWidth, sourceHeight)));
+    const scale = Math.min(1, maxSize / Math.max(sourceWidth, sourceHeight));
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
+    const pixels = Buffer.alloc(width * height);
     const values = [];
 
-    for (let y = 0; y < volume.shape.y; y += 1) {
-      for (let x = 0; x < volume.shape.x; x += 1) {
-        const value = volume.data[z * volume.shape.y * volume.shape.x + y * volume.shape.x + x];
+    function valueAt(outputX, outputY) {
+      const sourceX = Math.min(sourceWidth - 1, Math.floor((outputX / Math.max(1, width - 1)) * Math.max(0, sourceWidth - 1)));
+      const sourceY = Math.min(sourceHeight - 1, Math.floor((outputY / Math.max(1, height - 1)) * Math.max(0, sourceHeight - 1)));
+      const x = axis === "x" ? sliceIndex : sourceX;
+      const y = axis === "y" ? sliceIndex : axis === "x" ? sourceX : sourceY;
+      const z = axis === "z" ? sliceIndex : sourceY;
+      return volume.data[z * volume.shape.y * volume.shape.x + y * volume.shape.x + x];
+    }
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const value = valueAt(x, y);
         if (Number.isFinite(value) && Math.abs(value) <= 1_000_000) {
           values.push(value);
         }
@@ -424,15 +669,60 @@ async function handleApi(req, res) {
     const max = values[Math.floor(values.length * 0.99)] || 1;
     const range = max - min || 1;
 
-    for (let y = 0; y < volume.shape.y; y += 1) {
-      for (let x = 0; x < volume.shape.x; x += 1) {
-        const value = volume.data[z * volume.shape.y * volume.shape.x + y * volume.shape.x + x];
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const value = valueAt(x, y);
         const safeValue = Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : min;
-        pixels[y * volume.shape.x + x] = Math.max(0, Math.min(255, Math.round(((safeValue - min) / range) * 255)));
+        pixels[y * width + x] = Math.max(0, Math.min(255, Math.round(((safeValue - min) / range) * 255)));
       }
     }
 
-    sendBuffer(res, 200, pixels, "application/octet-stream");
+    sendBuffer(res, 200, pixels, "application/octet-stream", {
+      "X-QBI-Slice-Axis": axis,
+      "X-QBI-Slice-Level": level,
+      "X-QBI-Slice-Index": String(sliceIndex),
+      "X-QBI-Slice-Z": String(sliceIndex),
+      "X-QBI-Slice-Width": String(width),
+      "X-QBI-Slice-Height": String(height),
+      "X-QBI-Slice-Source-Width": String(sourceWidth),
+      "X-QBI-Slice-Source-Height": String(sourceHeight),
+      "X-QBI-Slice-Depth": String(axisSize)
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/slicer/export") {
+    const zarrPath = resolveScanPath(url.searchParams.get("path"));
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "Invalid scan path" });
+      return;
+    }
+
+    const level = url.searchParams.get("level") || "2";
+    const { body, filename } = await writeSlicerExport(zarrPath, level);
+    sendDownload(res, body, filename, "application/octet-stream");
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/slicer/open") {
+    const zarrPath = resolveScanPath(url.searchParams.get("path"));
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "Invalid scan path" });
+      return;
+    }
+
+    const level = url.searchParams.get("level") || "2";
+    const { filename, filePath } = await writeSlicerExport(zarrPath, level);
+    const opened = await openInSlicer(filePath);
+    const exportUrl = `/api/slicer/export?path=${encodeURIComponent(path.relative(__dirname, zarrPath))}&level=${encodeURIComponent(level)}`;
+
+    sendJson(res, 200, {
+      opened,
+      filename,
+      filePath,
+      exportUrl,
+      downloadUrl: "https://download.slicer.org/"
+    });
     return;
   }
 
@@ -489,7 +779,15 @@ async function handleApi(req, res) {
         }
 
         const scans = await findZarrs(targetRoot, "Uploaded");
-        sendJson(res, 200, { files, scans });
+        const validScans = scans.filter((scan) => scan.levels.length > 0);
+        if (scans.length > 0 && validScans.length === 0) {
+          sendJson(res, 400, {
+            error: "The uploaded .zarr folder is missing .zarray metadata files. Browser folder upload often skips hidden dotfiles; use the Local .zarr path field with the original folder instead."
+          });
+          return;
+        }
+
+        sendJson(res, 200, { files, scans: validScans });
       } catch (error) {
         sendJson(res, 500, { error: error.message });
       }

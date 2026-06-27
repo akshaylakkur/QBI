@@ -35,6 +35,13 @@
 
           <div class="field-stack">
             <label>
+              Local .zarr path
+              <span class="inline-field">
+                <input id="local-zarr-path" type="text" placeholder="/Users/name/path/to/scan.zarr">
+                <button id="open-local-zarr" type="button">Open</button>
+              </span>
+            </label>
+            <label>
               Dataset
               <select id="scan-select"></select>
             </label>
@@ -106,8 +113,21 @@
             </div>
             <div class="tool-buttons" aria-label="3D view tools">
               <button id="rotate-toggle" type="button" aria-label="Toggle rotation">R</button>
-              <button id="slice-back" type="button" aria-label="Previous slice">-</button>
-              <button id="slice-forward" type="button" aria-label="Next slice">+</button>
+              <div class="slice-slider-stack" aria-label="Orthogonal slice controls">
+                <label class="slice-slider-control" aria-label="X slice">
+                  <span id="x-slice-value">X -</span>
+                  <input id="x-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+                <label class="slice-slider-control" aria-label="Y slice">
+                  <span id="y-slice-value">Y -</span>
+                  <input id="y-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+                <label class="slice-slider-control" aria-label="Z slice">
+                  <span id="z-slice-value">Z -</span>
+                  <input id="z-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+              </div>
+              <button id="open-slicer" type="button" aria-label="Open volume in 3D Slicer">S</button>
               <button id="reload-scan" type="button" aria-label="Reload scan">L</button>
             </div>
           </div>
