@@ -21,3 +21,18 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+
+# Local Python environment and downloaded datasets
+.venv/
+data/
+
+# OS and editor noise
+.DS_Store
+**/.DS_Store
+
+# Node/frontend dependencies and generated local data
+node_modules/
+frontend/node_modules/
+frontend/uploaded_scans/
+frontend/.cache/
+frontend/dist/
