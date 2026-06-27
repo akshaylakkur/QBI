@@ -228,26 +228,79 @@ function normalizedSlicePosition(axis) {
   return (state.currentSlices[axis] / Math.max(1, state.volume.shape[axis] - 1)) - 0.5;
 }
 
+function volumeDimensions() {
+  if (!state.volume?.shape) {
+    return { x: 1, y: 1, z: 1 };
+  }
+
+  const { x, y, z } = state.volume.shape;
+  const longestAxis = Math.max(1, x, y, z);
+  return {
+    x: x / longestAxis,
+    y: y / longestAxis,
+    z: z / longestAxis
+  };
+}
+
+function sliceWorldPosition(axis) {
+  const dimensions = volumeDimensions();
+  return normalizedSlicePosition(axis) * dimensions[axis];
+}
+
 function createSliceGeometry(axis) {
+  const dimensions = volumeDimensions();
+  const geometry = new THREE.BufferGeometry();
+  const halfX = dimensions.x / 2;
+  const halfY = dimensions.y / 2;
+  const halfZ = dimensions.z / 2;
+  const uvs = [
+    0, 1,
+    1, 1,
+    1, 0,
+    0, 0
+  ];
+  let positions;
+
   if (axis === "x") {
-    return new THREE.PlaneGeometry(1, 1).rotateY(Math.PI / 2);
+    positions = [
+      0, halfY, halfZ,
+      0, -halfY, halfZ,
+      0, -halfY, -halfZ,
+      0, halfY, -halfZ
+    ];
+  } else if (axis === "y") {
+    positions = [
+      -halfX, 0, halfZ,
+      halfX, 0, halfZ,
+      halfX, 0, -halfZ,
+      -halfX, 0, -halfZ
+    ];
+  } else {
+    positions = [
+      -halfX, halfY, 0,
+      halfX, halfY, 0,
+      halfX, -halfY, 0,
+      -halfX, -halfY, 0
+    ];
   }
-  if (axis === "y") {
-    return new THREE.PlaneGeometry(1, 1).rotateX(Math.PI / 2);
-  }
-  return new THREE.PlaneGeometry(1, 1);
+
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex([0, 1, 2, 0, 2, 3]);
+  geometry.computeVertexNormals();
+  return geometry;
 }
 
 function positionSlicePlane(axis, plane) {
   if (axis === "x") {
-    plane.position.set(normalizedSlicePosition("x"), 0, 0);
+    plane.position.set(sliceWorldPosition("x"), 0, 0);
     return;
   }
   if (axis === "y") {
-    plane.position.set(0, -normalizedSlicePosition("y"), 0);
+    plane.position.set(0, -sliceWorldPosition("y"), 0);
     return;
   }
-  plane.position.set(0, 0, normalizedSlicePosition("z"));
+  plane.position.set(0, 0, sliceWorldPosition("z"));
 }
 
 function setActiveSliceAxis(axis) {
@@ -261,9 +314,9 @@ function createSliceMaterial(axis, texture) {
   const uniforms = {
     uTexture: { value: texture },
     uAxis: { value: axis === "x" ? 0 : axis === "y" ? 1 : 2 },
-    uX: { value: normalizedSlicePosition("x") },
-    uY: { value: -normalizedSlicePosition("y") },
-    uZ: { value: normalizedSlicePosition("z") },
+    uX: { value: sliceWorldPosition("x") },
+    uY: { value: -sliceWorldPosition("y") },
+    uZ: { value: sliceWorldPosition("z") },
     uGap: { value: 0.0035 },
     uBrightness: { value: 1.35 },
     uGamma: { value: 0.72 },
@@ -341,9 +394,9 @@ function createSliceMaterial(axis, texture) {
 
 function updateSliceSeams() {
   const seamValues = {
-    x: normalizedSlicePosition("x"),
-    y: -normalizedSlicePosition("y"),
-    z: normalizedSlicePosition("z")
+    x: sliceWorldPosition("x"),
+    y: -sliceWorldPosition("y"),
+    z: sliceWorldPosition("z")
   };
 
   sliceAxes.forEach((axis) => {
@@ -484,11 +537,12 @@ function renderPointCloud(payload) {
   const colors = new Float32Array(payload.points.length * 3);
   const strengths = new Float32Array(payload.points.length);
   const densities = new Float32Array(payload.points.length);
+  const dimensions = volumeDimensions();
 
   payload.points.forEach(([x, y, z, strength, density = strength], index) => {
-    positions[index * 3] = x;
-    positions[index * 3 + 1] = -y;
-    positions[index * 3 + 2] = z;
+    positions[index * 3] = x * dimensions.x;
+    positions[index * 3 + 1] = -y * dimensions.y;
+    positions[index * 3 + 2] = z * dimensions.z;
 
     strengths[index] = strength;
     densities[index] = density;
@@ -517,7 +571,11 @@ function renderPointCloud(payload) {
       roughness: 0.4
     });
     const marker = new THREE.Mesh(markerGeometry, markerMaterial);
-    marker.position.set(detection.coords[0], -detection.coords[1], detection.coords[2]);
+    marker.position.set(
+      detection.coords[0] * dimensions.x,
+      -detection.coords[1] * dimensions.y,
+      detection.coords[2] * dimensions.z
+    );
     marker.userData.detection = detection;
     labelGroup.add(marker);
     markerObjects.set(detection.id, marker);
