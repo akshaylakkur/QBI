@@ -93,7 +93,12 @@ def _build_scheduler(cfg: Config, optimizer, steps_per_epoch: int):
     if cfg.train.scheduler == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR
 
-        return CosineAnnealingLR(optimizer, T_max=cfg.train.epochs * steps_per_epoch,
+        # Stepped once per epoch (see the per-epoch scheduler.step() call in
+        # train()), so T_max is in *epochs*, not optimizer steps. Using
+        # epochs*steps_per_epoch here would make the cosine curve advance
+        # ~1/steps_per_epoch per epoch and the LR would stay ~flat for the
+        # whole run.
+        return CosineAnnealingLR(optimizer, T_max=cfg.train.epochs,
                                  eta_min=cfg.train.min_lr)
     if cfg.train.scheduler == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
