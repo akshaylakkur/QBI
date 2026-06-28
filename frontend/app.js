@@ -22,11 +22,31 @@ function getMoleculeGroups() {
   state.detections.forEach((det) => {
     const key = det.molecule || det.type;
     if (!map.has(key)) {
-      map.set(key, { molecule: key, label: det.type, color: det.color || "#0b7f83", picks: [] });
+      map.set(key, { molecule: key, label: det.type, picks: [] });
     }
     map.get(key).picks.push(det);
   });
   return [...map.values()];
+}
+
+function detectionKey(detection) {
+  return `${detection?.molecule || detection?.type || "unknown"}:${detection?.id || ""}`;
+}
+
+function refreshAnnotationNumbers() {
+  annotationNumbers = new Map();
+  getMoleculeGroups().forEach((group) => {
+    group.picks.forEach((detection, index) => {
+      annotationNumbers.set(detectionKey(detection), index + 1);
+    });
+  });
+}
+
+function annotationLabel(detection) {
+  if (state.selectedDetection) {
+    return detection.type;
+  }
+  return String(annotationNumbers.get(detectionKey(detection)) || "?");
 }
 
 const highDetailSliceLevel = "0";
@@ -41,6 +61,8 @@ const prefetchTimers = { x: null, y: null, z: null };
 const annotationLimit = 36;
 let precacheRunId = 0;
 let annotationItems = [];
+let annotationNumbers = new Map();
+let analysisRequestScan = null;
 
 const elements = {
   viewer: document.querySelector("#volume-viewer"),
@@ -101,13 +123,14 @@ const elements = {
 };
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xf8fbfb);
+scene.background = null;
 
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
 camera.position.set(1.55, 1.25, 1.65);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
 elements.viewer.appendChild(renderer.domElement);
 
 const mainSliceCanvas = document.createElement("canvas");
@@ -187,6 +210,10 @@ function detectionColorNumber(detection) {
   return (r << 16) + (g << 8) + b;
 }
 
+function detectionColorCss(detection) {
+  return `rgb(${detectionColorArray(detection).join(", ")})`;
+}
+
 function moleculeRadiusVoxels(detection) {
   if (Number.isFinite(detection?.radiusVoxel) && detection.radiusVoxel > 0) {
     return detection.radiusVoxel;
@@ -241,8 +268,61 @@ function detectionWorldPosition(detection) {
   );
 }
 
+function detectionSliceWorldPosition(detection, axis) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape;
+  const voxel = detection?.voxel;
+  if (!shape || !voxel) {
+    return null;
+  }
+
+  const dimensions = volumeDimensions();
+  const x = ((voxel.x / Math.max(1, shape.x - 1)) - 0.5) * dimensions.x;
+  const y = (0.5 - (voxel.y / Math.max(1, shape.y - 1))) * dimensions.y;
+  const z = ((voxel.z / Math.max(1, shape.z - 1)) - 0.5) * dimensions.z;
+
+  if (axis === "x") {
+    return new THREE.Vector3(sliceWorldPosition("x"), y, z);
+  }
+  if (axis === "y") {
+    return new THREE.Vector3(x, -sliceWorldPosition("y"), z);
+  }
+  return new THREE.Vector3(x, y, sliceWorldPosition("z"));
+}
+
+function visibleSliceAxesForDetection(detection) {
+  const voxel = detection?.voxel;
+  if (!voxel) {
+    return [];
+  }
+
+  return sliceAxes
+    .map((axis) => ({
+      axis,
+      distance: Math.abs(voxel[axis] - state.currentSlices[axis])
+    }))
+    .filter((item) => item.distance <= moleculeRadiusVoxels(detection))
+    .sort((a, b) => {
+      if (a.axis === state.activeSliceAxis) {
+        return -1;
+      }
+      if (b.axis === state.activeSliceAxis) {
+        return 1;
+      }
+      return a.distance - b.distance;
+    })
+    .map((item) => item.axis);
+}
+
+function annotationWorldPosition(detection) {
+  const visibleAxes = visibleSliceAxesForDetection(detection);
+  if (visibleAxes.length > 0) {
+    return detectionSliceWorldPosition(detection, visibleAxes[0]);
+  }
+  return state.selectedDetection ? detectionWorldPosition(detection) : null;
+}
+
 function projectedViewerPosition(detection) {
-  const worldPosition = detectionWorldPosition(detection);
+  const worldPosition = annotationWorldPosition(detection);
   if (!worldPosition) {
     return null;
   }
@@ -271,7 +351,30 @@ function selectedAnnotationDetections() {
 
   return state.detections
     .filter((detection) => (detection.molecule || detection.type) === state.selectedMolecule)
+    .filter((detection) => visibleSliceAxesForDetection(detection).length > 0)
     .slice(0, annotationLimit);
+}
+
+function focusSlicesOnDetection(detection) {
+  const voxel = detection?.voxel;
+  const shape = state.sliceShape || state.volume?.shape;
+  if (!voxel || !shape) {
+    return;
+  }
+
+  sliceAxes.forEach((axis) => {
+    const nextSlice = Math.max(0, Math.min(shape[axis] - 1, Math.round(voxel[axis])));
+    state.currentSlices[axis] = nextSlice;
+    if (elements.sliceSliders[axis]) {
+      elements.sliceSliders[axis].value = String(nextSlice);
+    }
+    setSliceSliderValue(axis);
+    scheduleInteractiveSlice(axis);
+  });
+
+  setActiveSliceAxis("z");
+  updateSliceSeams();
+  refreshSlicePreviews();
 }
 
 function syncViewerAnnotations() {
@@ -281,18 +384,18 @@ function syncViewerAnnotations() {
 
   const detections = selectedAnnotationDetections();
   elements.annotations.replaceChildren();
-  annotationItems = detections.map((detection, index) => {
+  annotationItems = detections.map((detection) => {
     const annotation = document.createElement("button");
     annotation.type = "button";
     annotation.className = `viewer-annotation${state.selectedDetection ? " is-single" : ""}`;
-    annotation.style.setProperty("--annotation-color", detection.color || "#0b7f83");
+    annotation.style.setProperty("--annotation-color", detectionColorCss(detection));
     annotation.dataset.detectionId = detection.id;
     const dot = document.createElement("span");
     dot.className = "viewer-annotation-dot";
     dot.setAttribute("aria-hidden", "true");
     const text = document.createElement("span");
     text.className = "viewer-annotation-text";
-    text.textContent = state.selectedDetection ? detection.type : `${index + 1}`;
+    text.textContent = annotationLabel(detection);
     annotation.append(dot, text);
     annotation.addEventListener("click", () => selectDetection(detection.id));
     elements.annotations.append(annotation);
@@ -315,7 +418,65 @@ function updateAnnotationPositions() {
     }
 
     element.hidden = false;
-    element.style.transform = `translate(${position.x + 10}px, ${position.y - 14}px)`;
+    element.style.transform = `translate(${position.x}px, ${position.y}px)`;
+  });
+}
+
+function downloadCanvasImage(canvas, filename) {
+  const link = document.createElement("a");
+  link.href = canvas.toDataURL("image/png");
+  link.download = filename;
+  link.click();
+}
+
+async function copyOrDownloadSlicePreview(axis) {
+  const canvas = elements.sliceCanvases[axis];
+  if (!canvas || canvas.width <= 1 || canvas.height <= 1) {
+    return;
+  }
+
+  const filename = `qbi-${axis}-slice-${state.currentSlices[axis]}.png`;
+  if (navigator.clipboard && window.ClipboardItem) {
+    try {
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (blob) {
+        await navigator.clipboard.write([
+          new ClipboardItem({ [blob.type]: blob })
+        ]);
+        setStatus("Slice copied", false);
+        return;
+      }
+    } catch (error) {
+      console.warn("Copying slice preview failed; downloading instead.", error);
+    }
+  }
+
+  downloadCanvasImage(canvas, filename);
+  setStatus("Slice downloaded", false);
+}
+
+function setupSlicePreviewInteractions() {
+  sliceAxes.forEach((axis) => {
+    const canvas = elements.sliceCanvases[axis];
+    const tile = canvas?.closest(".slice-preview-tile");
+    if (!canvas || !tile) {
+      return;
+    }
+
+    canvas.addEventListener("click", () => {
+      const wasExpanded = tile.classList.contains("is-expanded");
+      document.querySelectorAll(".slice-preview-tile.is-expanded").forEach((expandedTile) => {
+        if (expandedTile !== tile) {
+          expandedTile.classList.remove("is-expanded");
+        }
+      });
+      tile.classList.toggle("is-expanded", !wasExpanded);
+    });
+
+    canvas.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      copyOrDownloadSlicePreview(axis).catch(showError);
+    });
   });
 }
 
@@ -805,6 +966,7 @@ function renderDetectionList() {
   groups.forEach((group) => {
     const isSelected = state.selectedMolecule === group.molecule;
     const isExpanded = state.expandedMolecules.has(group.molecule);
+    const groupColor = detectionColorCss(group.picks[0] || { color: "#0b7f83" });
 
     const groupEl = document.createElement("div");
     groupEl.className = "molecule-group";
@@ -813,7 +975,7 @@ function renderDetectionList() {
     header.className = `molecule-group-header${isSelected ? " is-selected" : ""}`;
     header.type = "button";
     header.innerHTML = `
-      <span class="dot" style="background:${group.color}"></span>
+      <span class="dot" style="background:${groupColor}"></span>
       <span class="molecule-name">${group.label}</span>
       <span class="pick-badge">${group.picks.length}</span>
       <span class="expand-icon">${isExpanded ? "▾" : "▸"}</span>
@@ -842,7 +1004,12 @@ function renderDetectionList() {
         row.className = `molecule-pick-row${det.id === state.selectedDetection?.id ? " is-selected" : ""}`;
         row.type = "button";
         row.dataset.id = det.id;
-        row.textContent = det.id;
+        const dot = document.createElement("span");
+        dot.className = "dot molecule-pick-dot";
+        dot.style.background = detectionColorCss(det);
+        const label = document.createElement("span");
+        label.textContent = det.id;
+        row.append(dot, label);
         row.addEventListener("click", (e) => {
           e.stopPropagation();
           selectDetection(det.id);
@@ -865,12 +1032,12 @@ function renderAnalysis(analysis) {
     ? structured.insights
     : fallbackItems.map((item) => ({
         tone: item.difficulty === "easy" ? "positive" : item.difficulty.includes("hard") ? "warning" : "analytical",
-        label: `${item.label} frequency`,
-        text: `${item.count.toLocaleString()} picks, ${item.frequencyPercent.toFixed(1)}% of the dataset, ${item.clusterCount || 0} clusters, ${item.singletonClusters || 0} singleton clusters.`,
+        label: `${item.label}: ${item.count} picks · ${item.frequencyPercent.toFixed(1)}%`,
+        text: `${item.clusterCount} clusters, ${item.singletonClusters} singletons, largest cluster: ${item.largestClusterSize}.`,
         evidence: [
-          `${item.count.toLocaleString()} picks`,
-          `${item.frequencyPercent.toFixed(1)}% frequency`,
-          `${item.clusterCount || 0} clusters`
+          `${item.count} picks`,
+          `${item.frequencyPercent.toFixed(1)}%`,
+          `${item.clusterCount} clusters`
         ]
       }));
 
@@ -880,7 +1047,24 @@ function renderAnalysis(analysis) {
     return;
   }
 
-  elements.analysisStatus.textContent = analysis.reportStatus || "Generated";
+  elements.analysisStatus.textContent = analysis.reportStatus || "Ready";
+  elements.analysisStatus.classList.remove("active");
+
+  // Keywords pills
+  const keywords = structured?.keywords || [];
+  if (keywords.length > 0) {
+    const kwRow = document.createElement("div");
+    kwRow.className = "analysis-keywords";
+    keywords.forEach((word) => {
+      const tag = document.createElement("span");
+      tag.className = "keyword-tag";
+      tag.textContent = word;
+      kwRow.append(tag);
+    });
+    elements.analysisSummary.append(kwRow);
+  }
+
+  // Insight cards
   cards.forEach((item) => {
     const card = document.createElement("div");
     const tone = ["positive", "analytical", "warning", "serious"].includes(item.tone) ? item.tone : "analytical";
@@ -896,6 +1080,33 @@ function renderAnalysis(analysis) {
     elements.analysisSummary.append(card);
   });
 
+  // Spatial distribution section
+  if (structured?.spatialAnalysis) {
+    const section = document.createElement("div");
+    section.className = "analysis-section";
+    const heading = document.createElement("h4");
+    heading.className = "analysis-section-heading";
+    heading.textContent = "Spatial Distribution";
+    const body = document.createElement("p");
+    body.textContent = structured.spatialAnalysis;
+    section.append(heading, body);
+    elements.analysisSummary.append(section);
+  }
+
+  // Biological context section
+  if (structured?.biologicalContext) {
+    const section = document.createElement("div");
+    section.className = "analysis-section";
+    const heading = document.createElement("h4");
+    heading.className = "analysis-section-heading";
+    heading.textContent = "Biological Context";
+    const body = document.createElement("p");
+    body.textContent = structured.biologicalContext;
+    section.append(heading, body);
+    elements.analysisSummary.append(section);
+  }
+
+  // Report panel
   const report = analysis.report || analysis.localSummary || "";
   elements.analysisReport.replaceChildren();
   if (structured?.title) {
@@ -903,43 +1114,38 @@ function renderAnalysis(analysis) {
     heading.textContent = structured.title;
     elements.analysisReport.append(heading);
   }
-
   if (structured?.headline) {
     const paragraph = document.createElement("p");
     paragraph.textContent = structured.headline;
     elements.analysisReport.append(paragraph);
   }
-
   if (structured?.datasetSummary) {
     const heading = document.createElement("h3");
     heading.textContent = "Dataset Composition";
-    elements.analysisReport.append(heading);
-
     const paragraph = document.createElement("p");
     paragraph.textContent = structured.datasetSummary;
-    elements.analysisReport.append(paragraph);
+    elements.analysisReport.append(heading, paragraph);
   }
-
   if (structured?.caveats?.length) {
     const heading = document.createElement("h3");
     heading.textContent = "Caveats";
     elements.analysisReport.append(heading);
-
-    const paragraph = document.createElement("p");
-    paragraph.textContent = structured.caveats.join(" ");
-    elements.analysisReport.append(paragraph);
+    structured.caveats.forEach((cav) => {
+      const p = document.createElement("p");
+      p.textContent = cav;
+      elements.analysisReport.append(p);
+    });
   }
-
   if (structured?.nextSteps?.length) {
     const heading = document.createElement("h3");
     heading.textContent = "Next Validation Steps";
     elements.analysisReport.append(heading);
-
-    const paragraph = document.createElement("p");
-    paragraph.textContent = structured.nextSteps.join(" ");
-    elements.analysisReport.append(paragraph);
+    structured.nextSteps.forEach((step) => {
+      const p = document.createElement("p");
+      p.textContent = step;
+      elements.analysisReport.append(p);
+    });
   }
-
   if (!structured && report) {
     report.split(/\n{2,}/).forEach((block) => {
       const text = block.trim();
@@ -957,16 +1163,19 @@ function renderAnalysis(analysis) {
       elements.analysisReport.append(paragraph);
     });
   }
-
+  if (analysis.reportWarning) {
+    const warningEl = document.createElement("p");
+    warningEl.className = "analysis-warning";
+    warningEl.textContent = `⚠ ${analysis.reportWarning}`;
+    elements.analysisReport.append(warningEl);
+  }
   if (analysis.reportError || analysis.reportErrorBody) {
     const heading = document.createElement("h3");
-    heading.textContent = "Claude Error";
-    elements.analysisReport.append(heading);
-
+    heading.textContent = "Analysis Error";
     const errorBlock = document.createElement("pre");
     errorBlock.className = "analysis-error";
     errorBlock.textContent = [analysis.reportError, analysis.reportErrorBody].filter(Boolean).join("\n\n");
-    elements.analysisReport.append(errorBlock);
+    elements.analysisReport.append(heading, errorBlock);
   }
 }
 
@@ -1030,6 +1239,7 @@ function selectDetection(id) {
   state.selectedMolecule = detection.molecule || detection.type;
   state.expandedMolecules.add(state.selectedMolecule);
 
+  focusSlicesOnDetection(detection);
   showPickInfo(detection);
   syncViewerAnnotations();
   renderDetectionList();
@@ -1143,6 +1353,7 @@ async function loadPreview() {
   state.sliceShape = payload.levelShapes?.[state.sliceLevel] || payload.shape;
   sliceCache.clear();
   state.detections = payload.detections;
+  refreshAnnotationNumbers();
   state.selectedDetection = null;
   state.selectedMolecule = null;
   state.expandedMolecules.clear();
@@ -1166,6 +1377,9 @@ async function loadPreview() {
   syncViewerAnnotations();
   renderDetectionList();
   renderAnalysis(payload.analysis);
+  if (state.detections.length > 0) {
+    fetchClaudeAnalysis(state.selectedScan).catch(() => {});
+  }
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
   startSlicePrecache("Caching scan slices");
   setActiveSliceAxis("z");
@@ -1439,6 +1653,7 @@ async function uploadLabelsFolder() {
   }
 
   state.detections = payload.detections || [];
+  refreshAnnotationNumbers();
   state.selectedDetection = null;
   state.selectedMolecule = null;
   state.expandedMolecules.clear();
@@ -1452,6 +1667,7 @@ async function uploadLabelsFolder() {
   syncViewerAnnotations();
   renderDetectionList();
   renderAnalysis(payload.analysis);
+  fetchClaudeAnalysis(state.selectedScan).catch(() => {});
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
   startSlicePrecache("Caching label overlays");
 
@@ -1629,6 +1845,7 @@ function onInferenceComplete(data) {
   if (data.detections) {
     // Update state with new detections
     state.detections = data.detections;
+    refreshAnnotationNumbers();
     state.selectedDetection = null;
     state.selectedMolecule = null;
     state.expandedMolecules.clear();
@@ -1647,6 +1864,7 @@ function onInferenceComplete(data) {
     }
     renderDetectionList();
     renderAnalysis(data.analysis || {});
+    fetchClaudeAnalysis(state.selectedScan).catch(() => {});
     if (state.volume) {
       Promise.all(sliceAxes.map((axis) => loadSlice(axis))).then(() => {
         startSlicePrecache("Caching inference overlays");
@@ -1683,6 +1901,29 @@ function animate() {
   renderer.render(scene, camera);
 }
 
+async function fetchClaudeAnalysis(scanPath) {
+  if (!scanPath) {
+    return;
+  }
+  analysisRequestScan = scanPath;
+  elements.analysisStatus.textContent = "Generating AI analysis...";
+  elements.analysisStatus.classList.add("active");
+  try {
+    const result = await fetchJson("/api/analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ zarrPath: scanPath })
+    });
+    if (analysisRequestScan === scanPath) {
+      renderAnalysis(result);
+    }
+  } catch {
+    if (analysisRequestScan === scanPath) {
+      elements.analysisStatus.classList.remove("active");
+    }
+  }
+}
+
 elements.scanSelect.addEventListener("change", async () => {
   state.selectedScan = elements.scanSelect.value;
   syncLevelSelect();
@@ -1710,7 +1951,11 @@ sliceAxes.forEach((axis) => {
     setSliceSliderValue(axis);
     setActiveSliceAxis(axis);
     updateSliceSeams();
-    updateAnnotationPositions();
+    if (state.selectedMolecule && !state.selectedDetection) {
+      syncViewerAnnotations();
+    } else {
+      updateAnnotationPositions();
+    }
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });
@@ -1726,6 +1971,7 @@ function showError(error) {
   console.error(error);
 }
 
+setupSlicePreviewInteractions();
 resizeViewer();
 animate();
 
