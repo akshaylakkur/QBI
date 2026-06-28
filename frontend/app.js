@@ -1009,42 +1009,104 @@ function renderDetectionList() {
 function renderAnalysis(analysis) {
   elements.analysisSummary.replaceChildren();
 
-  if (!analysis?.aggregation?.items?.length) {
+  const structured = analysis?.structured || null;
+  const fallbackItems = analysis?.aggregation?.items || [];
+  const cards = Array.isArray(structured?.insights) && structured.insights.length > 0
+    ? structured.insights
+    : fallbackItems.map((item) => ({
+        tone: item.difficulty === "easy" ? "positive" : item.difficulty.includes("hard") ? "warning" : "analytical",
+        label: `${item.label} frequency`,
+        text: `${item.count.toLocaleString()} picks, ${item.frequencyPercent.toFixed(1)}% of the dataset, ${item.clusterCount || 0} clusters, ${item.singletonClusters || 0} singleton clusters.`,
+        evidence: [
+          `${item.count.toLocaleString()} picks`,
+          `${item.frequencyPercent.toFixed(1)}% frequency`,
+          `${item.clusterCount || 0} clusters`
+        ]
+      }));
+
+  if (!cards.length && !structured) {
     elements.analysisStatus.textContent = "Waiting for labels";
-    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule counts and a Claude-backed interpretation.";
+    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.";
     return;
   }
 
   elements.analysisStatus.textContent = analysis.reportStatus || "Generated";
-  analysis.aggregation.items.forEach((item) => {
+  cards.forEach((item) => {
     const card = document.createElement("div");
-    card.className = "analysis-card";
+    const tone = ["positive", "analytical", "warning", "serious"].includes(item.tone) ? item.tone : "analytical";
+    card.className = `analysis-card tone-${tone}`;
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
     card.innerHTML = `
-      <span class="dot" style="background:${item.color}"></span>
-      <strong>${item.label}</strong>
-      <b>${item.count.toLocaleString()}</b>
-      <small>${item.frequencyPercent.toFixed(1)}% · ${item.difficulty}</small>
+      <div class="analysis-card-head">
+        <strong>${item.label || "Insight"}</strong>
+      </div>
+      <p>${item.text || ""}</p>
+      ${evidence.length > 0 ? `<small>${evidence.join(" · ")}</small>` : ""}
     `;
     elements.analysisSummary.append(card);
   });
 
-  const report = analysis.report || analysis.localSummary || "No narrative report was returned.";
+  const report = analysis.report || analysis.localSummary || "";
   elements.analysisReport.replaceChildren();
-  report.split(/\n{2,}/).forEach((block) => {
-    const text = block.trim();
-    if (!text) {
-      return;
-    }
-    if (/^#{1,3}\s+/.test(text)) {
-      const heading = document.createElement("h3");
-      heading.textContent = text.replace(/^#{1,3}\s+/, "");
-      elements.analysisReport.append(heading);
-      return;
-    }
+  if (structured?.title) {
+    const heading = document.createElement("h3");
+    heading.textContent = structured.title;
+    elements.analysisReport.append(heading);
+  }
+
+  if (structured?.headline) {
     const paragraph = document.createElement("p");
-    paragraph.textContent = text.replace(/\*\*/g, "");
+    paragraph.textContent = structured.headline;
     elements.analysisReport.append(paragraph);
-  });
+  }
+
+  if (structured?.datasetSummary) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Dataset Composition";
+    elements.analysisReport.append(heading);
+
+    const paragraph = document.createElement("p");
+    paragraph.textContent = structured.datasetSummary;
+    elements.analysisReport.append(paragraph);
+  }
+
+  if (structured?.caveats?.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Caveats";
+    elements.analysisReport.append(heading);
+
+    const paragraph = document.createElement("p");
+    paragraph.textContent = structured.caveats.join(" ");
+    elements.analysisReport.append(paragraph);
+  }
+
+  if (structured?.nextSteps?.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Next Validation Steps";
+    elements.analysisReport.append(heading);
+
+    const paragraph = document.createElement("p");
+    paragraph.textContent = structured.nextSteps.join(" ");
+    elements.analysisReport.append(paragraph);
+  }
+
+  if (!structured && report) {
+    report.split(/\n{2,}/).forEach((block) => {
+      const text = block.trim();
+      if (!text) {
+        return;
+      }
+      if (/^#{1,3}\s+/.test(text)) {
+        const heading = document.createElement("h3");
+        heading.textContent = text.replace(/^#{1,3}\s+/, "");
+        elements.analysisReport.append(heading);
+        return;
+      }
+      const paragraph = document.createElement("p");
+      paragraph.textContent = text.replace(/\*\*/g, "");
+      elements.analysisReport.append(paragraph);
+    });
+  }
 
   if (analysis.reportError || analysis.reportErrorBody) {
     const heading = document.createElement("h3");

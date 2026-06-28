@@ -316,6 +316,9 @@ function buildMoleculeAggregation(detections, jsonFiles = 0, volume = null) {
         frequencyPercent: total > 0 ? (item.count / total) * 100 : 0,
         clusterThresholdAngstroms,
         clusterCount: clusters.length,
+        singletonClusters: clusters.filter((cluster) => cluster.count === 1).length,
+        multiPickClusters: clusters.filter((cluster) => cluster.count > 1).length,
+        largestClusterSize: clusters.reduce((max, cluster) => Math.max(max, cluster.count), 0),
         clusters: clusters.map((cluster, clusterIndex) => ({
           id: `${item.molecule}-cluster-${String(clusterIndex + 1).padStart(3, "0")}`,
           count: cluster.count,
@@ -463,6 +466,52 @@ function extractClaudeText(payload) {
   return parts.join("\n").trim();
 }
 
+function normalizeInsightTone(value) {
+  const tone = String(value || "analytical").toLowerCase();
+  if (tone === "positive" || tone === "warning" || tone === "serious") {
+    return tone;
+  }
+  return "analytical";
+}
+
+function buildStructuredFallbackAnalysis(aggregation) {
+  if (!aggregation.items.length) {
+    return {
+      title: "CryoET Object-Pick Label Summary",
+      headline: "No uploaded molecule labels were available for analysis.",
+      insights: [],
+      datasetSummary: "No uploaded molecule labels were available for analysis.",
+      caveats: [],
+      nextSteps: []
+    };
+  }
+
+  const dominant = aggregation.items[0];
+  return {
+    title: "CryoET Object-Pick Label Summary",
+    headline: `The dataset is dominated by ${dominant.label.toLowerCase()} picks, but clustering remains mostly sparse.`,
+    insights: aggregation.items.map((item) => ({
+      tone: item.difficulty === "easy" ? "positive" : item.difficulty.includes("hard") ? "warning" : "analytical",
+      label: `${item.label}: ${item.count.toLocaleString()} picks`,
+      text: `Represents ${item.frequencyPercent.toFixed(1)}% of the uploaded picks across ${item.clusterCount} clusters. Singleton clusters: ${item.singletonClusters}; largest cluster: ${item.largestClusterSize}.`,
+      evidence: [
+        `${item.count.toLocaleString()} picks`,
+        `${item.frequencyPercent.toFixed(1)}% frequency`,
+        `${item.clusterCount} clusters`
+      ]
+    })),
+    datasetSummary: `The uploaded labels contain ${aggregation.totalPicks.toLocaleString()} curated molecule picks across ${aggregation.items.length} molecular classes, spanning a volume of ${aggregation.volume?.dimensions?.z || 0} × ${aggregation.volume?.dimensions?.y || 0} × ${aggregation.volume?.dimensions?.x || 0} voxels.`,
+    caveats: [
+      "This is one tomographic volume, so the result is descriptive rather than generalizable.",
+      "High singleton rates can reflect true sparsity, annotation fragmentation, or boundary effects."
+    ],
+    nextSteps: [
+      "Compare against matched controls or replicate volumes before making biological claims.",
+      "Use the cluster structure to inspect whether the same molecule repeatedly accumulates in the same subregions."
+    ]
+  };
+}
+
 function buildClaudeAnalysisInput(aggregation) {
   return {
     volume: aggregation.volume,
@@ -477,6 +526,9 @@ function buildClaudeAnalysisInput(aggregation) {
       frequencyPercent: Number(item.frequencyPercent.toFixed(3)),
       clusterThresholdAngstroms: Number(item.clusterThresholdAngstroms.toFixed(3)),
       clusterCount: item.clusterCount,
+      singletonClusters: item.singletonClusters,
+      multiPickClusters: item.multiPickClusters,
+      largestClusterSize: item.largestClusterSize,
       clusters: item.clusters.map((cluster) => ({
         id: cluster.id,
         count: cluster.count,
@@ -505,29 +557,114 @@ function buildClaudeAnalysisInput(aggregation) {
 function buildClaudeSystemPrompt() {
   return [
     "You analyze CryoET object-pick label summaries for research triage.",
-    "Be scientifically cautious.",
+    "Be scientifically cautious but still useful.",
+    "Use the supplied cluster and frequency statistics to generate hypothesis-level interpretations, not certainty.",
     "Do not claim clinical, mechanistic, or drug-response conclusions from a single uploaded label folder.",
-    "Use only the supplied aggregated counts.",
-    "If the data is insufficient, say so plainly.",
-    "Write a concise report with headings: Dataset Composition, Frequency Interpretation, Caveats, Downstream Use, Drug-Discovery Relevance, Next Validation Steps."
+    "If a pattern is only suggestive, say it is suggestive and explain why.",
+    "Do not repeat the molecule name as the only label; produce interpretive labels such as high frequency, sparse clustering, possible enrichment, or cautionary exclusion.",
+    "Where a broad biological implication is plausible, mention it as a hypothesis only and tie it directly to the observed clustering or frequency pattern.",
+    "Do not force disease or metabolism claims when the data does not support them.",
+    "Use four tone tags exactly: positive, analytical, warning, serious.",
+    "Positive means a constructive signal or robust pattern.",
+    "Analytical means a neutral measurement-based observation.",
+    "Warning means a caveat, ambiguity, or potential artifact.",
+    "Serious means exclusion, a strong caution, or an important limitation.",
+    "Return valid JSON only. Do not use markdown fences.",
+    "Required JSON shape: {\"title\": string, \"headline\": string, \"insights\": [{\"tone\": string, \"label\": string, \"text\": string, \"evidence\": [string]}], \"datasetSummary\": string, \"caveats\": [string], \"nextSteps\": [string]}",
+    "Keep the output concise but substantive."
   ].join(" ");
 }
 
 function buildClaudeUserPrompt(aggregation) {
   const input = buildClaudeAnalysisInput(aggregation);
   return [
-    "Create a concise research-style report from the JSON below.",
+    "Create a research-style interpretation from the JSON below.",
+    "Focus on how frequency, cluster size, singleton rate, and cluster concentration might relate to biological signal versus annotation noise.",
+    "Generate insight labels that a UI can display as colored cards, with a concise interpretive label and a supporting explanation.",
+    "Use labels like 'High frequency of thyroglobulin', 'Sparse clustering for beta galactosidase', 'Possible enrichment of ribosome signal', or 'Beta amylase excluded from scoring'.",
+    "Avoid labels that are only the molecule name.",
+    "Include molecule-specific insights where appropriate, but also include cross-cutting insights when multiple molecules show a comparable pattern.",
+    "If a specific disease or metabolism hypothesis is not strongly supported, say that it remains speculative rather than forcing a claim.",
+    "Mention the score-exclusion status for beta amylase explicitly.",
     "Only use the fields in the JSON and do not infer extra measurements.",
     "If a molecule has no observations, do not fabricate one.",
-    "JSON:",
+    "JSON input:",
     JSON.stringify(input, null, 2)
   ].join("\n\n");
+}
+
+function parseClaudeAnalysisJson(text) {
+  const cleaned = text.trim();
+  if (!cleaned) {
+    return null;
+  }
+
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+
+  const candidate = cleaned.slice(start, end + 1);
+  try {
+    const parsed = JSON.parse(candidate);
+    const insights = Array.isArray(parsed.insights) ? parsed.insights.map((insight) => ({
+      tone: normalizeInsightTone(insight.tone),
+      label: String(insight.label || "").trim(),
+      text: String(insight.text || "").trim(),
+      evidence: Array.isArray(insight.evidence) ? insight.evidence.map((entry) => String(entry)) : []
+    })).filter((insight) => insight.label || insight.text) : [];
+
+    return {
+      title: String(parsed.title || "CryoET Object-Pick Label Summary").trim(),
+      headline: String(parsed.headline || "").trim(),
+      insights,
+      datasetSummary: String(parsed.datasetSummary || "").trim(),
+      caveats: Array.isArray(parsed.caveats) ? parsed.caveats.map((entry) => String(entry)).filter(Boolean) : [],
+      nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps.map((entry) => String(entry)).filter(Boolean) : []
+    };
+  } catch {
+    return null;
+  }
+}
+
+function structuredAnalysisToMarkdown(structured) {
+  if (!structured) {
+    return "";
+  }
+
+  const blocks = [];
+  if (structured.title) {
+    blocks.push(`### ${structured.title}`);
+  }
+  if (structured.headline) {
+    blocks.push(structured.headline);
+  }
+  if (structured.datasetSummary) {
+    blocks.push(`### Dataset Summary\n${structured.datasetSummary}`);
+  }
+  if (structured.insights?.length) {
+    const lines = structured.insights.map((insight) => `- [${insight.tone}] ${insight.label}: ${insight.text}`);
+    blocks.push(`### Insight Cards\n${lines.join("\n")}`);
+  }
+  if (structured.caveats?.length) {
+    blocks.push(`### Caveats\n${structured.caveats.map((item) => `- ${item}`).join("\n")}`);
+  }
+  if (structured.nextSteps?.length) {
+    blocks.push(`### Next Validation Steps\n${structured.nextSteps.map((item) => `- ${item}`).join("\n")}`);
+  }
+  return blocks.join("\n\n");
 }
 
 async function generateClaudeAnalysis(aggregation) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return { report: buildLocalAnalysisSummary(aggregation), reportStatus: "Local summary" };
+    const structured = buildStructuredFallbackAnalysis(aggregation);
+    return {
+      structured,
+      report: structuredAnalysisToMarkdown(structured),
+      reportStatus: "Ready"
+    };
   }
 
   const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
@@ -568,9 +705,11 @@ async function generateClaudeAnalysis(aggregation) {
     } catch {
       // Keep the raw response excerpt.
     }
+    const structured = buildStructuredFallbackAnalysis(aggregation);
     return {
-      report: `${buildLocalAnalysisSummary(aggregation)}\n\n### Claude Report Status\n${message}`,
-      reportStatus: `Claude unavailable (${response.status})`,
+      structured,
+      report: `${structuredAnalysisToMarkdown(structured)}\n\n### Claude Error\n${message}`,
+      reportStatus: "API error",
       reportError: message,
       reportErrorBody: body,
       reportErrorStatus: response.status
@@ -578,9 +717,11 @@ async function generateClaudeAnalysis(aggregation) {
   }
 
   const payload = await response.json();
+  const structured = parseClaudeAnalysisJson(extractClaudeText(payload)) || buildStructuredFallbackAnalysis(aggregation);
   return {
-    report: extractClaudeText(payload) || buildLocalAnalysisSummary(aggregation),
-    reportStatus: `Claude · ${model}`
+    structured,
+    report: structuredAnalysisToMarkdown(structured) || extractClaudeText(payload) || buildLocalAnalysisSummary(aggregation),
+    reportStatus: "Ready"
   };
 }
 
