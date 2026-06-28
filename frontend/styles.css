@@ -553,14 +553,13 @@ input[type="range"] {
 
 .review-grid {
   display: grid;
-  grid-template-columns: minmax(250px, 0.9fr) minmax(300px, 1.2fr) minmax(250px, 0.9fr);
+  grid-template-columns: minmax(250px, 0.9fr) minmax(320px, 1.4fr);
   gap: 18px;
   align-items: stretch;
 }
 
 .detections-panel,
-.detail-panel,
-.info-panel {
+.detail-panel {
   min-height: 270px;
 }
 
@@ -730,37 +729,78 @@ input[type="range"] {
 
 .analysis-card {
   display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 7px;
-  padding: 8px;
+  gap: 8px;
+  padding: 10px 11px;
   border: 1px solid #d4e0e4;
   border-radius: 8px;
   background: #f8fbfb;
 }
 
+.analysis-card .analysis-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .analysis-card strong,
-.analysis-card b,
-.analysis-card small {
+.analysis-card small,
+.analysis-card p {
   min-width: 0;
 }
 
 .analysis-card strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   font-size: 12px;
-}
-
-.analysis-card b {
-  font-size: 14px;
-  color: var(--text-main);
+  font-weight: 800;
+  line-height: 1.2;
 }
 
 .analysis-card small {
-  grid-column: 2 / 4;
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.analysis-card p {
+  margin: 0;
+  color: var(--text-main);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.analysis-card.tone-positive {
+  border-color: #b9e5c1;
+  background: #f0fbf2;
+}
+
+.analysis-card.tone-positive strong {
+  color: #16743a;
+}
+
+.analysis-card.tone-analytical {
+  border-color: #bfd6f5;
+  background: #f2f7ff;
+}
+
+.analysis-card.tone-analytical strong {
+  color: #1f4f9f;
+}
+
+.analysis-card.tone-warning {
+  border-color: #f4d0a3;
+  background: #fff8ef;
+}
+
+.analysis-card.tone-warning strong {
+  color: #a45a00;
+}
+
+.analysis-card.tone-serious {
+  border-color: #f0b4b4;
+  background: #fff4f4;
+}
+
+.analysis-card.tone-serious strong {
+  color: #aa1d1d;
 }
 
 .analysis-report {
@@ -793,6 +833,18 @@ input[type="range"] {
   line-height: 1.4;
   white-space: pre-wrap;
   overflow-x: auto;
+}
+
+.analysis-detail {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.analysis-detail-heading h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-main);
 }
 
 .slice-preview-item {

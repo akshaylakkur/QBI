@@ -2,8 +2,6 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import {
   Deck,
-  COORDINATE_SYSTEM,
-  ScatterplotLayer,
   VolumeLayer,
   VolumeView,
   getDefaultInitialViewState,
@@ -142,16 +140,10 @@ controls.dampingFactor = 0.08;
 controls.target.set(0, 0, 0);
 
 const volumeGroup = new THREE.Group();
-const labelGroup = new THREE.Group();
 scene.add(volumeGroup);
-scene.add(labelGroup);
 
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-let pointsObject = null;
 const slicePlaneObjects = { x: null, y: null, z: null };
 const sliceRequestIds = { x: 0, y: 0, z: 0 };
-const markerObjects = new Map();
 
 scene.add(new THREE.AmbientLight(0xffffff, 1.05));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.35);
@@ -370,21 +362,6 @@ function createColorizedSliceData(axis, bytes, width, height) {
   return textureData;
 }
 
-function vivDetectionPosition(detection) {
-  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape || { x: 1, y: 1, z: 1 };
-  const res = vivLoader ? Math.max(0, vivLoader.length - 1) : 0;
-  const voxel = detection.voxel && Number.isFinite(detection.voxel.x)
-    ? detection.voxel
-    : {
-        x: (detection.coords?.[0] + 0.5) * Math.max(1, shape.x - 1),
-        y: (detection.coords?.[1] + 0.5) * Math.max(1, shape.y - 1),
-        z: (detection.coords?.[2] + 0.5) * Math.max(1, shape.z - 1)
-      };
-  // Viv world coords: x ≈ voxel x, y is inverted (world y=0 at image bottom),
-  // z is scaled to the loaded resolution level
-  return [voxel.x, shape.y - voxel.y, voxel.z / (2 ** res)];
-}
-
 function vivLayerProps() {
   return {
     id: "qbi-viv-volume",
@@ -403,52 +380,6 @@ function vivLayerProps() {
   };
 }
 
-function vivDetectionLayer() {
-  const selectedId = state.selectedDetection?.id;
-  const selectedMol = state.selectedMolecule;
-
-  return new ScatterplotLayer({
-    id: "qbi-pick-overlay",
-    data: state.detections,
-    pickable: true,
-    coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-    opacity: 0.9,
-    stroked: true,
-    filled: true,
-    lineWidthMinPixels: 1,
-    radiusMinPixels: 3,
-    radiusMaxPixels: 28,
-    getPosition: vivDetectionPosition,
-    getRadius: (det) => {
-      const radius = moleculeRadiusVoxels(det);
-      if (det.id === selectedId) return radius * 1.45;
-      const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
-      return radius * (inGroup ? 1 : 0.72);
-    },
-    getFillColor: (det) => {
-      if (det.id === selectedId) return [255, 185, 50, 255];
-      const c = detectionColorArray(det);
-      const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
-      return [...c, inGroup ? 210 : 80];
-    },
-    getLineColor: (det) => {
-      if (det.id === selectedId) return [255, 255, 255, 255];
-      const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
-      return [12, 22, 30, inGroup ? 220 : 50];
-    },
-    updateTriggers: {
-      getFillColor: [selectedId, selectedMol],
-      getLineColor: [selectedId, selectedMol],
-      getRadius: [selectedId, selectedMol]
-    },
-    onClick: ({ object }) => {
-      if (object?.id) {
-        selectDetection(object.id);
-      }
-    }
-  });
-}
-
 function updateVivLayers() {
   if (!vivDeck || !vivLoader || !state.vivActive) {
     return;
@@ -456,8 +387,7 @@ function updateVivLayers() {
 
   vivDeck.setProps({
     layers: [
-      new VolumeLayer(vivLayerProps()),
-      vivDetectionLayer()
+      new VolumeLayer(vivLayerProps())
     ]
   });
 }
@@ -507,8 +437,6 @@ async function setupVivViewer() {
     }
 
     clearGroup(volumeGroup);
-    clearGroup(labelGroup);
-    markerObjects.clear();
     sliceAxes.forEach((axis) => {
       slicePlaneObjects[axis] = null;
     });
@@ -528,8 +456,7 @@ async function setupVivViewer() {
         vivDeck?.setProps({ viewState: { "3d": vivViewState } });
       },
       layers: [
-        new VolumeLayer(vivLayerProps()),
-        vivDetectionLayer()
+        new VolumeLayer(vivLayerProps())
       ]
     });
     return true;
@@ -680,7 +607,7 @@ function createSliceGeometry(axis) {
   let positions;
 
   if (axis === "x") {
-    // Row 0 of the texture (z=0) must land at world z=-halfZ to match marker positions
+    // Row 0 of the texture (z=0) must land at world z=-halfZ to match volume orientation.
     positions = [
       0, halfY, -halfZ,
       0, -halfY, -halfZ,
@@ -688,7 +615,7 @@ function createSliceGeometry(axis) {
       0, halfY, halfZ
     ];
   } else if (axis === "y") {
-    // Same z-direction fix for the y-slice
+    // Same z-direction fix for the y-slice.
     positions = [
       -halfX, 0, -halfZ,
       halfX, 0, -halfZ,
@@ -902,9 +829,6 @@ function refreshSlicePreviews() {
 
 function renderVolumeScene(payload) {
   clearGroup(volumeGroup);
-  clearGroup(labelGroup);
-  markerObjects.clear();
-  pointsObject = null;
   sliceAxes.forEach((axis) => {
     slicePlaneObjects[axis] = null;
   });
@@ -919,29 +843,6 @@ function renderVolumeScene(payload) {
   frame.name = "volume-bounds";
   volumeGroup.add(frame);
 
-  const sharedGeometry = new THREE.SphereGeometry(1, 24, 16);
-
-  payload.detections.forEach((detection) => {
-    const markerMaterial = new THREE.MeshStandardMaterial({
-      color: detectionColorNumber(detection),
-      emissive: new THREE.Color(detectionColorNumber(detection)),
-      emissiveIntensity: 0.15,
-      roughness: 0.4
-    });
-    const marker = new THREE.Mesh(sharedGeometry, markerMaterial);
-    marker.position.set(
-      detection.coords[0] * dimensions.x,
-      -detection.coords[1] * dimensions.y,
-      detection.coords[2] * dimensions.z
-    );
-    marker.userData.baseScale = moleculeRadiusWorld(detection);
-    marker.scale.setScalar(marker.userData.baseScale);
-    marker.userData.detection = detection;
-    labelGroup.add(marker);
-    markerObjects.set(detection.id, marker);
-  });
-
-  updateMarkerHighlights();
   elements.message.hidden = true;
 }
 
@@ -1009,42 +910,104 @@ function renderDetectionList() {
 function renderAnalysis(analysis) {
   elements.analysisSummary.replaceChildren();
 
-  if (!analysis?.aggregation?.items?.length) {
+  const structured = analysis?.structured || null;
+  const fallbackItems = analysis?.aggregation?.items || [];
+  const cards = Array.isArray(structured?.insights) && structured.insights.length > 0
+    ? structured.insights
+    : fallbackItems.map((item) => ({
+        tone: item.difficulty === "easy" ? "positive" : item.difficulty.includes("hard") ? "warning" : "analytical",
+        label: `${item.label} frequency`,
+        text: `${item.count.toLocaleString()} picks, ${item.frequencyPercent.toFixed(1)}% of the dataset, ${item.clusterCount || 0} clusters, ${item.singletonClusters || 0} singleton clusters.`,
+        evidence: [
+          `${item.count.toLocaleString()} picks`,
+          `${item.frequencyPercent.toFixed(1)}% frequency`,
+          `${item.clusterCount || 0} clusters`
+        ]
+      }));
+
+  if (!cards.length && !structured) {
     elements.analysisStatus.textContent = "Waiting for labels";
-    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule counts and a Claude-backed interpretation.";
+    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.";
     return;
   }
 
   elements.analysisStatus.textContent = analysis.reportStatus || "Generated";
-  analysis.aggregation.items.forEach((item) => {
+  cards.forEach((item) => {
     const card = document.createElement("div");
-    card.className = "analysis-card";
+    const tone = ["positive", "analytical", "warning", "serious"].includes(item.tone) ? item.tone : "analytical";
+    card.className = `analysis-card tone-${tone}`;
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
     card.innerHTML = `
-      <span class="dot" style="background:${item.color}"></span>
-      <strong>${item.label}</strong>
-      <b>${item.count.toLocaleString()}</b>
-      <small>${item.frequencyPercent.toFixed(1)}% · ${item.difficulty}</small>
+      <div class="analysis-card-head">
+        <strong>${item.label || "Insight"}</strong>
+      </div>
+      <p>${item.text || ""}</p>
+      ${evidence.length > 0 ? `<small>${evidence.join(" · ")}</small>` : ""}
     `;
     elements.analysisSummary.append(card);
   });
 
-  const report = analysis.report || analysis.localSummary || "No narrative report was returned.";
+  const report = analysis.report || analysis.localSummary || "";
   elements.analysisReport.replaceChildren();
-  report.split(/\n{2,}/).forEach((block) => {
-    const text = block.trim();
-    if (!text) {
-      return;
-    }
-    if (/^#{1,3}\s+/.test(text)) {
-      const heading = document.createElement("h3");
-      heading.textContent = text.replace(/^#{1,3}\s+/, "");
-      elements.analysisReport.append(heading);
-      return;
-    }
+  if (structured?.title) {
+    const heading = document.createElement("h3");
+    heading.textContent = structured.title;
+    elements.analysisReport.append(heading);
+  }
+
+  if (structured?.headline) {
     const paragraph = document.createElement("p");
-    paragraph.textContent = text.replace(/\*\*/g, "");
+    paragraph.textContent = structured.headline;
     elements.analysisReport.append(paragraph);
-  });
+  }
+
+  if (structured?.datasetSummary) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Dataset Composition";
+    elements.analysisReport.append(heading);
+
+    const paragraph = document.createElement("p");
+    paragraph.textContent = structured.datasetSummary;
+    elements.analysisReport.append(paragraph);
+  }
+
+  if (structured?.caveats?.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Caveats";
+    elements.analysisReport.append(heading);
+
+    const paragraph = document.createElement("p");
+    paragraph.textContent = structured.caveats.join(" ");
+    elements.analysisReport.append(paragraph);
+  }
+
+  if (structured?.nextSteps?.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Next Validation Steps";
+    elements.analysisReport.append(heading);
+
+    const paragraph = document.createElement("p");
+    paragraph.textContent = structured.nextSteps.join(" ");
+    elements.analysisReport.append(paragraph);
+  }
+
+  if (!structured && report) {
+    report.split(/\n{2,}/).forEach((block) => {
+      const text = block.trim();
+      if (!text) {
+        return;
+      }
+      if (/^#{1,3}\s+/.test(text)) {
+        const heading = document.createElement("h3");
+        heading.textContent = text.replace(/^#{1,3}\s+/, "");
+        elements.analysisReport.append(heading);
+        return;
+      }
+      const paragraph = document.createElement("p");
+      paragraph.textContent = text.replace(/\*\*/g, "");
+      elements.analysisReport.append(paragraph);
+    });
+  }
 
   if (analysis.reportError || analysis.reportErrorBody) {
     const heading = document.createElement("h3");
@@ -1090,24 +1053,6 @@ function showMoleculeGroupInfo(group) {
   elements.selectedNotes.textContent = `${group.label} curated overlay picks from the TS_5_4 experiment run.`;
 }
 
-function updateMarkerHighlights() {
-  const selectedId = state.selectedDetection?.id || null;
-  const selectedMol = state.selectedMolecule;
-
-  markerObjects.forEach((marker, markerId) => {
-    const det = marker.userData.detection;
-    const isSelected = markerId === selectedId;
-    const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
-
-    marker.material.color.set(
-      isSelected ? 0xb96d12 : (inGroup ? detectionColorNumber(det) : 0xb8c8cc)
-    );
-    marker.material.emissiveIntensity = isSelected ? 0.35 : (inGroup ? 0.15 : 0);
-    const baseScale = marker.userData.baseScale || moleculeRadiusWorld(det);
-    marker.scale.setScalar(baseScale * (isSelected ? 1.45 : inGroup ? 1.0 : 0.6));
-  });
-}
-
 function selectMoleculeGroup(molecule) {
   state.selectedMolecule = molecule;
   state.selectedDetection = null;
@@ -1117,14 +1062,12 @@ function selectMoleculeGroup(molecule) {
     showMoleculeGroupInfo(group);
   }
 
-  updateMarkerHighlights();
   updateVivLayers();
 }
 
 function clearMoleculeSelection() {
   state.selectedMolecule = null;
   state.selectedDetection = null;
-  updateMarkerHighlights();
   updateVivLayers();
   renderDetectionList();
 }
@@ -1140,12 +1083,6 @@ function selectDetection(id) {
   state.expandedMolecules.add(state.selectedMolecule);
 
   showPickInfo(detection);
-  updateMarkerHighlights();
-
-  const marker = markerObjects.get(id);
-  if (marker) {
-    controls.target.copy(marker.position);
-  }
 
   updateVivLayers();
   renderDetectionList();
@@ -1646,23 +1583,10 @@ async function openSelectedScanInSlicer() {
   }
 }
 
-function onPointerDown(event) {
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const intersections = raycaster.intersectObjects([...markerObjects.values()]);
-  const selected = intersections[0]?.object?.userData?.detection;
-  if (selected) {
-    selectDetection(selected.id);
-  }
-}
-
 function animate() {
   requestAnimationFrame(animate);
   if (state.autoRotate) {
     volumeGroup.rotation.z += 0.002;
-    labelGroup.rotation.z += 0.002;
   }
   controls.update();
   renderer.render(scene, camera);
@@ -1676,11 +1600,6 @@ elements.scanSelect.addEventListener("change", async () => {
 elements.levelSelect.addEventListener("change", () => loadPreview().catch(showError));
 elements.strideSelect.addEventListener("change", () => loadPreview().catch(showError));
 elements.pointLimit.addEventListener("change", () => loadPreview().catch(showError));
-elements.pointSize.addEventListener("input", () => {
-  if (pointsObject) {
-    pointsObject.material.uniforms.uPointSize.value = pointSizePixels();
-  }
-});
 elements.upload.addEventListener("change", () => uploadZarrFolder().catch(showError));
 elements.labelsUpload.addEventListener("change", () => uploadLabelsFolder().catch(showError));
 elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch(showError));
@@ -1721,7 +1640,6 @@ sliceAxes.forEach((axis) => {
     scheduleInteractiveSlice(axis);
   });
 });
-renderer.domElement.addEventListener("pointerdown", onPointerDown);
 window.addEventListener("resize", resizeViewer);
 
 function showError(error) {
