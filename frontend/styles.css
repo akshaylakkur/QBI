@@ -339,9 +339,11 @@ input[type="range"] {
 }
 
 .volume-canvas {
-  min-height: clamp(390px, 54vh, 660px);
+  height: clamp(390px, 54vh, 660px);
   position: relative;
   overflow: hidden;
+  display: grid;
+  place-items: center;
   border: 1px solid #9eb0b6;
   border-radius: 8px;
   background: #f8fbfb;
@@ -351,6 +353,17 @@ input[type="range"] {
   display: block;
   width: 100%;
   height: 100%;
+}
+
+.volume-canvas canvas[hidden] {
+  display: none;
+}
+
+.volume-canvas .main-slice-canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #fff;
 }
 
 .viewer-message {

@@ -11,6 +11,11 @@ const sampleDir = path.join(__dirname, "sample_data");
 const uploadsDir = path.join(__dirname, "uploaded_scans");
 const slicerExportDir = path.join(os.tmpdir(), "qbi-slicer-exports");
 const volumeCache = new Map();
+const volumeLoadCache = new Map();
+const sliceCache = new Map();
+const sliceLoadCache = new Map();
+let sliceCacheBytes = 0;
+const maxSliceCacheBytes = 96 * 1024 * 1024;
 const localScans = new Map();
 
 const mimeTypes = {
@@ -135,6 +140,23 @@ async function listZarrLevels(zarrPath) {
     }
     return b.localeCompare(a);
   });
+}
+
+async function readZarrLevelShapes(zarrPath) {
+  const levels = await listZarrLevels(zarrPath);
+  const shapes = {};
+
+  await Promise.all(levels.map(async (level) => {
+    try {
+      const metadata = await readJson(path.join(zarrPath, level, ".zarray"));
+      const [z, y, x] = metadata.shape;
+      shapes[level] = { z, y, x };
+    } catch {
+      // Ignore malformed levels here; the loader will surface the error if used.
+    }
+  }));
+
+  return shapes;
 }
 
 function scanPayload(id, name, scanPath, levels) {
@@ -307,7 +329,20 @@ async function loadVolumePreview(zarrPath, levelName = "2") {
   if (volumeCache.has(cacheKey)) {
     return volumeCache.get(cacheKey);
   }
+  if (volumeLoadCache.has(cacheKey)) {
+    return volumeLoadCache.get(cacheKey);
+  }
 
+  const loadPromise = loadVolumeData(zarrPath, resolvedLevel, cacheKey);
+  volumeLoadCache.set(cacheKey, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    volumeLoadCache.delete(cacheKey);
+  }
+}
+
+async function loadVolumeData(zarrPath, resolvedLevel, cacheKey) {
   const arrayPath = path.join(zarrPath, resolvedLevel);
   const metadata = await readJson(path.join(arrayPath, ".zarray"));
   const [depth, height, width] = metadata.shape;
@@ -538,6 +573,165 @@ function buildDetections(volume) {
   ];
 }
 
+function renderPythonZarrSlice(zarrPath, level, axis, requestedIndex, maxSize) {
+  const script = `
+import json
+import sys
+
+import numpy as np
+import zarr
+
+store_path, level, axis, requested_index, requested_max_size = sys.argv[1:6]
+requested_index = int(requested_index)
+requested_max_size = int(requested_max_size)
+
+root = zarr.open(store_path, mode="r")
+volume = root if hasattr(root, "shape") else root[level]
+z_count, y_count, x_count = volume.shape
+shape = {"z": z_count, "y": y_count, "x": x_count}
+axis_size = shape[axis]
+slice_index = max(0, min(axis_size - 1, requested_index))
+
+if axis == "x":
+    image = np.asarray(volume[:, :, slice_index])
+elif axis == "y":
+    image = np.asarray(volume[:, slice_index, :])
+else:
+    image = np.asarray(volume[slice_index, :, :])
+
+source_height, source_width = image.shape
+max_size = max(64, min(1024, requested_max_size or max(source_width, source_height)))
+scale = min(1.0, max_size / max(source_width, source_height))
+width = max(1, int(round(source_width * scale)))
+height = max(1, int(round(source_height * scale)))
+
+if width != source_width or height != source_height:
+    y_indices = np.linspace(0, source_height - 1, height).astype(np.int64)
+    x_indices = np.linspace(0, source_width - 1, width).astype(np.int64)
+    image = image[np.ix_(y_indices, x_indices)]
+
+finite = np.isfinite(image) & (np.abs(image) <= 1_000_000)
+if np.any(finite):
+    low, high = np.percentile(image[finite], [1, 99])
+else:
+    low, high = 0.0, 1.0
+if not np.isfinite(high - low) or high == low:
+    high = low + 1.0
+
+safe = np.where(finite, image, low)
+pixels = np.clip(np.rint(((safe - low) / (high - low)) * 255), 0, 255).astype(np.uint8)
+meta = {
+    "axis": axis,
+    "level": level,
+    "index": slice_index,
+    "width": int(width),
+    "height": int(height),
+    "sourceWidth": int(source_width),
+    "sourceHeight": int(source_height),
+    "depth": int(axis_size),
+    "low": float(low),
+    "high": float(high),
+}
+sys.stderr.write("__QBI_META__" + json.dumps(meta) + "\\n")
+sys.stdout.buffer.write(pixels.tobytes(order="C"))
+`;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", [
+      "-c",
+      script,
+      zarrPath,
+      level,
+      axis,
+      String(requestedIndex),
+      String(maxSize)
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        MPLCONFIGDIR: path.join(os.tmpdir(), "qbi-matplotlib")
+      }
+    });
+
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const errorText = Buffer.concat(stderr).toString("utf8");
+      if (code !== 0) {
+        reject(new Error(errorText || `Python slice renderer exited with code ${code}`));
+        return;
+      }
+
+      const metaLine = errorText.split(/\r?\n/).find((line) => line.startsWith("__QBI_META__"));
+      if (!metaLine) {
+        reject(new Error("Python slice renderer did not return metadata"));
+        return;
+      }
+
+      resolve({
+        meta: JSON.parse(metaLine.replace("__QBI_META__", "")),
+        pixels: Buffer.concat(stdout)
+      });
+    });
+  });
+}
+
+function sliceCacheKey(zarrPath, level, axis, index, maxSize) {
+  return `${zarrPath}:${level}:${axis}:${index}:${maxSize}`;
+}
+
+function getCachedSlice(key) {
+  const cached = sliceCache.get(key);
+  if (!cached) {
+    return null;
+  }
+  sliceCache.delete(key);
+  sliceCache.set(key, cached);
+  return cached;
+}
+
+function setCachedSlice(key, value) {
+  if (sliceCache.has(key)) {
+    sliceCacheBytes -= sliceCache.get(key).pixels.length;
+    sliceCache.delete(key);
+  }
+
+  sliceCache.set(key, value);
+  sliceCacheBytes += value.pixels.length;
+
+  while (sliceCacheBytes > maxSliceCacheBytes && sliceCache.size > 0) {
+    const oldestKey = sliceCache.keys().next().value;
+    const oldest = sliceCache.get(oldestKey);
+    sliceCacheBytes -= oldest.pixels.length;
+    sliceCache.delete(oldestKey);
+  }
+}
+
+async function loadCachedPythonZarrSlice(zarrPath, level, axis, index, maxSize) {
+  const key = sliceCacheKey(zarrPath, level, axis, index, maxSize);
+  const cached = getCachedSlice(key);
+  if (cached) {
+    return cached;
+  }
+  if (sliceLoadCache.has(key)) {
+    return sliceLoadCache.get(key);
+  }
+
+  const promise = renderPythonZarrSlice(zarrPath, level, axis, index, maxSize)
+    .then((result) => {
+      setCachedSlice(key, result);
+      return result;
+    })
+    .finally(() => {
+      sliceLoadCache.delete(key);
+    });
+  sliceLoadCache.set(key, promise);
+  return promise;
+}
+
 async function handleApi(req, res) {
   const url = new URL(req.url, `http://localhost:${port}`);
 
@@ -602,13 +796,23 @@ async function handleApi(req, res) {
 
     const level = url.searchParams.get("level") || "2";
     const stride = Number.parseInt(url.searchParams.get("stride") || "2", 10);
-    const limit = Number.parseInt(url.searchParams.get("limit") || "38000", 10);
-    const volume = await loadVolumePreview(zarrPath, level);
+    const levels = await listZarrLevels(zarrPath);
+    const levelShapes = await readZarrLevelShapes(zarrPath);
+    const resolvedLevel = levelShapes[level] ? level : levels[0];
+    const shape = levelShapes[resolvedLevel];
+    if (!shape) {
+      sendJson(res, 400, { error: `No Zarr array metadata found in ${path.basename(zarrPath)}` });
+      return;
+    }
+
     sendJson(res, 200, {
-      level: volume.level,
-      levels: await listZarrLevels(zarrPath),
-      ...buildPointCloud(volume, stride, limit),
-      detections: buildDetections(volume)
+      level: resolvedLevel,
+      levels,
+      levelShapes,
+      shape,
+      stats: { min: 0, max: 0, points: 0, stride },
+      points: [],
+      detections: buildDetections({ shape })
     });
     return;
   }
@@ -624,69 +828,40 @@ async function handleApi(req, res) {
     const level = url.searchParams.get("level") || "2";
     const sourceLevel = url.searchParams.get("sourceLevel") || level;
     const sourceIndex = Number.parseInt(url.searchParams.get("index") || url.searchParams.get(axis) || url.searchParams.get("z") || "0", 10);
+    const maxSize = Math.max(64, Math.min(1024, Number.parseInt(url.searchParams.get("maxSize") || "0", 10) || 1024));
     let sourceShape = null;
 
     if (sourceLevel !== level) {
-      sourceShape = (await loadVolumePreview(zarrPath, sourceLevel)).shape;
+      sourceShape = (await readZarrLevelShapes(zarrPath))[sourceLevel] || null;
     }
 
-    const volume = await loadVolumePreview(zarrPath, level);
-    const axisSize = volume.shape[axis];
+    const levelShapes = await readZarrLevelShapes(zarrPath);
+    const shape = levelShapes[level];
+    if (!shape) {
+      sendJson(res, 400, { error: `Zarr level ${level} was not found` });
+      return;
+    }
+
+    const axisSize = shape[axis];
     const sourceAxisSize = sourceShape?.[axis] || axisSize;
     const mappedIndex = sourceShape
       ? Math.round((Math.max(0, Math.min(sourceAxisSize - 1, sourceIndex)) / Math.max(1, sourceAxisSize - 1)) * (axisSize - 1))
       : sourceIndex;
     const sliceIndex = Math.max(0, Math.min(axisSize - 1, Number.isFinite(mappedIndex) ? mappedIndex : Math.floor(axisSize / 2)));
-    const sourceWidth = axis === "x" ? volume.shape.y : volume.shape.x;
-    const sourceHeight = axis === "z" ? volume.shape.y : volume.shape.z;
-    const maxSize = Math.max(64, Math.min(1024, Number.parseInt(url.searchParams.get("maxSize") || "0", 10) || Math.max(sourceWidth, sourceHeight)));
-    const scale = Math.min(1, maxSize / Math.max(sourceWidth, sourceHeight));
-    const width = Math.max(1, Math.round(sourceWidth * scale));
-    const height = Math.max(1, Math.round(sourceHeight * scale));
-    const pixels = Buffer.alloc(width * height);
-    const values = [];
-
-    function valueAt(outputX, outputY) {
-      const sourceX = Math.min(sourceWidth - 1, Math.floor((outputX / Math.max(1, width - 1)) * Math.max(0, sourceWidth - 1)));
-      const sourceY = Math.min(sourceHeight - 1, Math.floor((outputY / Math.max(1, height - 1)) * Math.max(0, sourceHeight - 1)));
-      const x = axis === "x" ? sliceIndex : sourceX;
-      const y = axis === "y" ? sliceIndex : axis === "x" ? sourceX : sourceY;
-      const z = axis === "z" ? sliceIndex : sourceY;
-      return volume.data[z * volume.shape.y * volume.shape.x + y * volume.shape.x + x];
-    }
-
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const value = valueAt(x, y);
-        if (Number.isFinite(value) && Math.abs(value) <= 1_000_000) {
-          values.push(value);
-        }
-      }
-    }
-
-    values.sort((a, b) => a - b);
-    const min = values[Math.floor(values.length * 0.01)] || 0;
-    const max = values[Math.floor(values.length * 0.99)] || 1;
-    const range = max - min || 1;
-
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const value = valueAt(x, y);
-        const safeValue = Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : min;
-        pixels[y * width + x] = Math.max(0, Math.min(255, Math.round(((safeValue - min) / range) * 255)));
-      }
-    }
+    const { meta, pixels } = await loadCachedPythonZarrSlice(zarrPath, level, axis, sliceIndex, maxSize);
 
     sendBuffer(res, 200, pixels, "application/octet-stream", {
       "X-QBI-Slice-Axis": axis,
-      "X-QBI-Slice-Level": level,
-      "X-QBI-Slice-Index": String(sliceIndex),
-      "X-QBI-Slice-Z": String(sliceIndex),
-      "X-QBI-Slice-Width": String(width),
-      "X-QBI-Slice-Height": String(height),
-      "X-QBI-Slice-Source-Width": String(sourceWidth),
-      "X-QBI-Slice-Source-Height": String(sourceHeight),
-      "X-QBI-Slice-Depth": String(axisSize)
+      "X-QBI-Slice-Level": meta.level,
+      "X-QBI-Slice-Index": String(meta.index),
+      "X-QBI-Slice-Z": String(meta.index),
+      "X-QBI-Slice-Width": String(meta.width),
+      "X-QBI-Slice-Height": String(meta.height),
+      "X-QBI-Slice-Source-Width": String(meta.sourceWidth),
+      "X-QBI-Slice-Source-Height": String(meta.sourceHeight),
+      "X-QBI-Slice-Depth": String(meta.depth),
+      "X-QBI-Slice-Low": String(meta.low),
+      "X-QBI-Slice-High": String(meta.high)
     });
     return;
   }

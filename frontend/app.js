@@ -6,6 +6,8 @@ const state = {
   selectedScan: null,
   selectedLevel: "2",
   volume: null,
+  sliceShape: null,
+  sliceLevel: "0",
   detections: [],
   selectedDetection: null,
   currentSlices: { x: 0, y: 0, z: 0 },
@@ -14,8 +16,12 @@ const state = {
 };
 
 const highDetailSliceLevel = "0";
-const highDetailSliceMaxSize = "600";
+const highDetailSliceMaxSize = "1024";
+const interactiveSliceMaxSize = "420";
 const sliceAxes = ["x", "y", "z"];
+const sliceCache = new Map();
+const sliceTimers = { x: null, y: null, z: null };
+const prefetchTimers = { x: null, y: null, z: null };
 
 const elements = {
   viewer: document.querySelector("#volume-viewer"),
@@ -81,6 +87,13 @@ camera.position.set(1.55, 1.25, 1.65);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 elements.viewer.appendChild(renderer.domElement);
+
+const mainSliceCanvas = document.createElement("canvas");
+mainSliceCanvas.className = "main-slice-canvas";
+mainSliceCanvas.width = 1;
+mainSliceCanvas.height = 1;
+mainSliceCanvas.hidden = true;
+elements.viewer.appendChild(mainSliceCanvas);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -225,7 +238,8 @@ function normalizedSlicePosition(axis) {
   if (!state.volume) {
     return 0;
   }
-  return (state.currentSlices[axis] / Math.max(1, state.volume.shape[axis] - 1)) - 0.5;
+  const shape = state.sliceShape || state.volume.shape;
+  return (state.currentSlices[axis] / Math.max(1, shape[axis] - 1)) - 0.5;
 }
 
 function volumeDimensions() {
@@ -233,7 +247,7 @@ function volumeDimensions() {
     return { x: 1, y: 1, z: 1 };
   }
 
-  const { x, y, z } = state.volume.shape;
+  const { x, y, z } = state.sliceShape || state.volume.shape;
   const longestAxis = Math.max(1, x, y, z);
   return {
     x: x / longestAxis,
@@ -318,8 +332,8 @@ function createSliceMaterial(axis, texture) {
     uY: { value: -sliceWorldPosition("y") },
     uZ: { value: sliceWorldPosition("z") },
     uGap: { value: 0.0035 },
-    uBrightness: { value: 1.35 },
-    uGamma: { value: 0.72 },
+    uBrightness: { value: 1 },
+    uGamma: { value: 1 },
     uLineWidth: { value: 0.0045 }
   };
 
@@ -414,9 +428,9 @@ function updateVolumeSlicePlane(axis, bytes, width, height) {
   const textureData = new Uint8Array(width * height * 4);
   for (let index = 0; index < bytes.length; index += 1) {
     const value = bytes[index];
-    textureData[index * 4] = Math.min(255, Math.round(value * 1.04));
-    textureData[index * 4 + 1] = Math.min(255, Math.round(value * 1.08));
-    textureData[index * 4 + 2] = Math.min(255, Math.round(value * 1.1 + 8));
+    textureData[index * 4] = value;
+    textureData[index * 4 + 1] = value;
+    textureData[index * 4 + 2] = value;
     textureData[index * 4 + 3] = 255;
   }
 
@@ -447,8 +461,7 @@ function updateVolumeSlicePlane(axis, bytes, width, height) {
   setActiveSliceAxis(state.activeSliceAxis);
 }
 
-function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedIndex) {
-  const canvas = elements.sliceCanvases[axis];
+function drawGrayscaleCanvas(canvas, bytes, width, height) {
   if (!canvas) {
     return;
   }
@@ -467,43 +480,21 @@ function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedInd
   }
 
   context.putImageData(image, 0, 0);
+}
 
-  const xRatio = state.currentSlices.x / Math.max(1, state.volume.shape.x - 1);
-  const yRatio = state.currentSlices.y / Math.max(1, state.volume.shape.y - 1);
-  const zRatio = state.currentSlices.z / Math.max(1, state.volume.shape.z - 1);
-  const lines = axis === "x"
-    ? [
-        { color: "#26c943", vertical: yRatio },
-        { color: "#2465ff", horizontal: zRatio }
-      ]
-    : axis === "y"
-      ? [
-          { color: "#ff2b23", vertical: xRatio },
-          { color: "#2465ff", horizontal: zRatio }
-        ]
-      : [
-          { color: "#ff2b23", vertical: xRatio },
-          { color: "#26c943", horizontal: yRatio }
-        ];
+function drawMainSlice(axis, bytes, width, height, renderedLevel, renderedIndex) {
+  drawGrayscaleCanvas(mainSliceCanvas, bytes, width, height);
+  elements.message.hidden = true;
+  elements.pointCount.textContent = `${axis.toUpperCase()} slice L${renderedLevel} ${renderedIndex}`;
+}
 
-  context.save();
-  context.lineWidth = Math.max(1, Math.round(Math.min(width, height) * 0.006));
-  lines.forEach((line) => {
-    context.strokeStyle = line.color;
-    context.beginPath();
-    if (Number.isFinite(line.vertical)) {
-      const x = Math.round(line.vertical * (width - 1)) + 0.5;
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
-    } else {
-      const y = Math.round(line.horizontal * (height - 1)) + 0.5;
-      context.moveTo(0, y);
-      context.lineTo(width, y);
-    }
-    context.stroke();
-  });
-  context.restore();
+function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedIndex) {
+  const canvas = elements.sliceCanvases[axis];
+  if (!canvas) {
+    return;
+  }
 
+  drawGrayscaleCanvas(canvas, bytes, width, height);
   elements.sliceLabels[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]} | L${renderedLevel} ${renderedIndex}`;
 }
 
@@ -525,42 +516,24 @@ function refreshSlicePreviews() {
   });
 }
 
-function renderPointCloud(payload) {
+function renderVolumeScene(payload) {
   clearGroup(volumeGroup);
   clearGroup(labelGroup);
   markerObjects.clear();
+  pointsObject = null;
   sliceAxes.forEach((axis) => {
     slicePlaneObjects[axis] = null;
   });
 
-  const positions = new Float32Array(payload.points.length * 3);
-  const colors = new Float32Array(payload.points.length * 3);
-  const strengths = new Float32Array(payload.points.length);
-  const densities = new Float32Array(payload.points.length);
   const dimensions = volumeDimensions();
-
-  payload.points.forEach(([x, y, z, strength, density = strength], index) => {
-    positions[index * 3] = x * dimensions.x;
-    positions[index * 3 + 1] = -y * dimensions.y;
-    positions[index * 3 + 2] = z * dimensions.z;
-
-    strengths[index] = strength;
-    densities[index] = density;
-    const color = densityColor(strength, density);
-    colors[index * 3] = color.r;
-    colors[index * 3 + 1] = color.g;
-    colors[index * 3 + 2] = color.b;
-  });
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-  geometry.setAttribute("strength", new THREE.BufferAttribute(strengths, 1));
-  geometry.setAttribute("density", new THREE.BufferAttribute(densities, 1));
-
-  pointsObject = new THREE.Points(geometry, createVolumePointMaterial());
-  pointsObject.renderOrder = 2;
-  volumeGroup.add(pointsObject);
+  const box = new THREE.BoxGeometry(dimensions.x, dimensions.y, dimensions.z);
+  const edges = new THREE.EdgesGeometry(box);
+  const frame = new THREE.LineSegments(
+    edges,
+    new THREE.LineBasicMaterial({ color: 0x71818a, transparent: true, opacity: 0.34 })
+  );
+  frame.name = "volume-bounds";
+  volumeGroup.add(frame);
 
   payload.detections.forEach((detection) => {
     const markerGeometry = new THREE.SphereGeometry(0.028, 24, 16);
@@ -643,6 +616,38 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
+function sliceCacheKey(axis, index, maxSize = highDetailSliceMaxSize) {
+  return [
+    state.selectedScan,
+    state.sliceLevel || elements.levelSelect.value,
+    axis,
+    index,
+    maxSize
+  ].join("|");
+}
+
+function getCachedSlice(axis, index, maxSize = highDetailSliceMaxSize) {
+  const key = sliceCacheKey(axis, index, maxSize);
+  const cached = sliceCache.get(key);
+  if (!cached) {
+    return null;
+  }
+  sliceCache.delete(key);
+  sliceCache.set(key, cached);
+  return cached;
+}
+
+function setCachedSlice(axis, index, maxSize, value) {
+  const key = sliceCacheKey(axis, index, maxSize);
+  if (sliceCache.has(key)) {
+    sliceCache.delete(key);
+  }
+  sliceCache.set(key, value);
+  while (sliceCache.size > 96) {
+    sliceCache.delete(sliceCache.keys().next().value);
+  }
+}
+
 async function loadScans() {
   setStatus("Finding scans", true);
   const payload = await fetchJson("/api/scans");
@@ -708,26 +713,31 @@ async function loadPreview() {
     elements.levelSelect.value = payload.level;
   }
   state.volume = payload;
+  state.sliceLevel = payload.levelShapes?.[highDetailSliceLevel] ? highDetailSliceLevel : payload.level;
+  state.sliceShape = payload.levelShapes?.[state.sliceLevel] || payload.shape;
+  sliceCache.clear();
   state.detections = payload.detections;
   state.currentSlices = {
-    x: Math.floor(payload.shape.x / 2),
-    y: Math.floor(payload.shape.y / 2),
-    z: Math.floor(payload.shape.z / 2)
+    x: Math.floor(state.sliceShape.x / 2),
+    y: Math.floor(state.sliceShape.y / 2),
+    z: Math.floor(state.sliceShape.z / 2)
   };
   state.activeSliceAxis = "z";
   sliceAxes.forEach((axis) => {
-    elements.sliceSliders[axis].max = String(Math.max(0, payload.shape[axis] - 1));
+    elements.sliceSliders[axis].max = String(Math.max(0, state.sliceShape[axis] - 1));
     elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
     elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
   });
 
-  renderPointCloud(payload);
+  renderVolumeScene(payload);
   renderDetectionList();
   selectDetection(payload.detections[0]?.id);
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
   setActiveSliceAxis("z");
+  camera.position.set(1.55, 1.25, 1.65);
+  controls.target.set(0, 0, 0);
+  controls.update();
 
-  elements.pointCount.textContent = `${payload.stats.points.toLocaleString()} points`;
   elements.shape.textContent = `${payload.shape.x} x ${payload.shape.y} x ${payload.shape.z}`;
   elements.range.textContent = `${payload.stats.min.toFixed(3)} to ${payload.stats.max.toFixed(3)}`;
   elements.stride.textContent = `${payload.stats.stride}`;
@@ -735,29 +745,85 @@ async function loadPreview() {
   setStatus("Ready", false);
 }
 
-async function loadSlice(axis = "z") {
+function prefetchNeighborSlices(axis) {
+  clearTimeout(prefetchTimers[axis]);
+  prefetchTimers[axis] = setTimeout(() => {
+    if (!state.volume) {
+      return;
+    }
+    const maxIndex = Math.max(0, state.sliceShape[axis] - 1);
+    const center = state.currentSlices[axis];
+    [-2, -1, 1, 2].forEach((offset) => {
+      const index = center + offset;
+      if (index < 0 || index > maxIndex) {
+        return;
+      }
+      loadSlice(axis, {
+        index,
+        maxSize: highDetailSliceMaxSize,
+        render: false,
+        prefetch: true
+      }).catch(() => {});
+    });
+  }, 80);
+}
+
+function scheduleInteractiveSlice(axis) {
+  clearTimeout(sliceTimers[axis]);
+  loadSlice(axis, { maxSize: interactiveSliceMaxSize }).catch(showError);
+  sliceTimers[axis] = setTimeout(() => {
+    loadSlice(axis, { maxSize: highDetailSliceMaxSize })
+      .then(() => prefetchNeighborSlices(axis))
+      .catch(showError);
+  }, 140);
+}
+
+function renderSlice(axis, slice) {
+  updateVolumeSlicePlane(axis, slice.bytes, slice.width, slice.height);
+  elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
+  elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
+  drawSlicePreview(axis, slice.bytes, slice.width, slice.height, slice.renderedLevel, slice.renderedIndex);
+  elements.pointCount.textContent = `${axis.toUpperCase()} slice L${slice.renderedLevel} ${slice.renderedIndex}`;
+}
+
+async function loadSlice(axis = "z", options = {}) {
   if (!state.volume) {
     return;
   }
 
-  const requestId = sliceRequestIds[axis] + 1;
-  sliceRequestIds[axis] = requestId;
-  const requestedSlice = state.currentSlices[axis];
+  const {
+    maxSize = highDetailSliceMaxSize,
+    render = true,
+    prefetch = false,
+    index = state.currentSlices[axis]
+  } = options;
+  const requestedSlice = index;
+  const cached = getCachedSlice(axis, requestedSlice, maxSize);
+  if (cached) {
+    if (render) {
+      renderSlice(axis, cached);
+    }
+    return cached;
+  }
+
+  const requestId = prefetch ? sliceRequestIds[axis] : sliceRequestIds[axis] + 1;
+  if (!prefetch) {
+    sliceRequestIds[axis] = requestId;
+  }
 
   const previewLevel = elements.levelSelect.value;
-  const detailLevel = highDetailSliceLevel;
+  const detailLevel = state.sliceLevel || previewLevel;
   const params = new URLSearchParams({
     path: state.selectedScan,
     axis,
     level: detailLevel,
-    sourceLevel: previewLevel,
-    maxSize: highDetailSliceMaxSize,
+    maxSize,
     index: String(requestedSlice)
   });
   let response = await fetch(`/api/zarr/slice?${params.toString()}`);
   if (!response.ok && detailLevel !== previewLevel) {
     params.set("level", previewLevel);
-    params.delete("sourceLevel");
+    params.set("sourceLevel", detailLevel);
     response = await fetch(`/api/zarr/slice?${params.toString()}`);
   }
   if (!response.ok) {
@@ -765,19 +831,20 @@ async function loadSlice(axis = "z") {
   }
 
   const bytes = new Uint8ClampedArray(await response.arrayBuffer());
-  if (requestId !== sliceRequestIds[axis] || requestedSlice !== state.currentSlices[axis]) {
-    return;
+  if (!prefetch && (requestId !== sliceRequestIds[axis] || requestedSlice !== state.currentSlices[axis])) {
+    return null;
   }
 
   const width = Number(response.headers.get("X-QBI-Slice-Width")) || state.volume.shape.x;
   const height = Number(response.headers.get("X-QBI-Slice-Height")) || state.volume.shape.y;
   const renderedLevel = response.headers.get("X-QBI-Slice-Level") || previewLevel;
   const renderedIndex = response.headers.get("X-QBI-Slice-Index") || String(requestedSlice);
-  updateVolumeSlicePlane(axis, bytes, width, height);
-
-  elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
-  elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
-  drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedIndex);
+  const slice = { bytes, width, height, renderedLevel, renderedIndex };
+  setCachedSlice(axis, requestedSlice, maxSize, slice);
+  if (render) {
+    renderSlice(axis, slice);
+  }
+  return slice;
 }
 
 async function uploadZarrFolder() {
@@ -910,6 +977,7 @@ elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch
 elements.resetCamera.addEventListener("click", () => {
   camera.position.set(1.55, 1.25, 1.65);
   controls.target.set(0, 0, 0);
+  controls.update();
 });
 elements.rotateToggle.addEventListener("click", () => {
   state.autoRotate = !state.autoRotate;
@@ -927,7 +995,7 @@ sliceAxes.forEach((axis) => {
     setActiveSliceAxis(axis);
     updateSliceSeams();
     refreshSlicePreviews();
-    loadSlice(axis).catch(showError);
+    scheduleInteractiveSlice(axis);
   });
 });
 renderer.domElement.addEventListener("pointerdown", onPointerDown);
