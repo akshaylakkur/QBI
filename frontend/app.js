@@ -1,12 +1,5 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import {
-  Deck,
-  VolumeLayer,
-  VolumeView,
-  getDefaultInitialViewState,
-  loadOmeZarr
-} from "./vendor/viv-bundle.js";
 
 const state = {
   scans: [],
@@ -21,8 +14,7 @@ const state = {
   expandedMolecules: new Set(),
   currentSlices: { x: 0, y: 0, z: 0 },
   activeSliceAxis: "z",
-  autoRotate: false,
-  vivActive: false
+  autoRotate: false
 };
 
 function getMoleculeGroups() {
@@ -46,15 +38,14 @@ const sliceAxes = ["x", "y", "z"];
 const sliceCache = new Map();
 const sliceTimers = { x: null, y: null, z: null };
 const prefetchTimers = { x: null, y: null, z: null };
+const annotationLimit = 36;
 let precacheRunId = 0;
-let vivDeck = null;
-let vivLoader = null;
-let vivView = null;
-let vivViewState = null;
+let annotationItems = [];
 
 const elements = {
   viewer: document.querySelector("#volume-viewer"),
   message: document.querySelector("#viewer-message"),
+  annotations: document.querySelector("#viewer-annotations"),
   scanSelect: document.querySelector("#scan-select"),
   levelSelect: document.querySelector("#level-select"),
   strideSelect: document.querySelector("#stride-select"),
@@ -66,10 +57,6 @@ const elements = {
   openLocalZarr: document.querySelector("#open-local-zarr"),
   loadStatus: document.querySelector("#load-status"),
   progress: document.querySelector("#load-progress"),
-  pointCount: document.querySelector("#point-count"),
-  shape: document.querySelector("#volume-shape"),
-  range: document.querySelector("#volume-range"),
-  stride: document.querySelector("#volume-stride"),
   detectionCount: document.querySelector("#detection-count"),
   analysisStatus: document.querySelector("#analysis-status"),
   analysisSummary: document.querySelector("#analysis-summary"),
@@ -92,9 +79,6 @@ const elements = {
     z: document.querySelector("#z-slice-label")
   },
   resetCamera: document.querySelector("#reset-camera"),
-  rotateToggle: document.querySelector("#rotate-toggle"),
-  openSlicer: document.querySelector("#open-slicer"),
-  reloadScan: document.querySelector("#reload-scan"),
   sliceSliders: {
     x: document.querySelector("#x-slice-slider"),
     y: document.querySelector("#y-slice-slider"),
@@ -121,11 +105,6 @@ camera.position.set(1.55, 1.25, 1.65);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 elements.viewer.appendChild(renderer.domElement);
-
-const vivContainer = document.createElement("div");
-vivContainer.className = "viv-volume-viewer";
-vivContainer.hidden = true;
-elements.viewer.appendChild(vivContainer);
 
 const mainSliceCanvas = document.createElement("canvas");
 mainSliceCanvas.className = "main-slice-canvas";
@@ -159,7 +138,9 @@ function setStatus(text, active = false) {
 }
 
 function setProgress(percent) {
-  elements.progress.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  if (elements.progress) {
+    elements.progress.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  }
 }
 
 function showLoadingScreen(title, detail = "") {
@@ -181,39 +162,7 @@ function resizeViewer() {
   camera.aspect = rect.width / Math.max(1, rect.height);
   camera.updateProjectionMatrix();
   renderer.setSize(rect.width, rect.height, false);
-
-  if (vivDeck && state.vivActive) {
-    vivDeck.setProps({ width: rect.width, height: rect.height });
-  }
-}
-
-function scanSupportsViv(scanPath = state.selectedScan) {
-  return Boolean(scanPath && !scanPath.startsWith("local:"));
-}
-
-function scanPathToVivUrl(scanPath) {
-  return `/${String(scanPath).split("/").map(encodeURIComponent).join("/")}`;
-}
-
-function sliceInterval(axis) {
-  const shape = state.sliceShape || state.volume?.shape;
-  if (!shape) {
-    return null;
-  }
-  const voxel = state.currentSlices[axis];
-  if (axis === "y") {
-    // Viv 3D texture has y inverted: world y=0 = image bottom (voxel y=max)
-    const worldY = shape.y - voxel;
-    return [worldY, worldY];
-  }
-  if (axis === "z") {
-    // Volume is loaded at coarser resolution; z world units = level-0 z / 2^resolution
-    const res = vivLoader ? Math.max(0, vivLoader.length - 1) : 0;
-    const worldZ = voxel / (2 ** res);
-    return [worldZ, worldZ];
-  }
-  // x: world x ≈ level-0 voxel x directly
-  return [voxel, voxel];
+  updateAnnotationPositions();
 }
 
 function detectionColorArray(detection) {
@@ -264,6 +213,106 @@ function moleculeRadiusWorld(detection) {
   const longestAxis = Math.max(1, shape.x, shape.y, shape.z);
   const normalizedRadius = moleculeRadiusVoxels(detection) / longestAxis;
   return normalizedRadius * Math.max(dimensions.x, dimensions.y, dimensions.z);
+}
+
+function setSliceSliderValue(axis) {
+  const valueElement = elements.sliceSliderValues[axis];
+  if (valueElement) {
+    valueElement.textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
+  }
+}
+
+function detectionWorldPosition(detection) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape;
+  const voxel = detection?.voxel;
+  if (!shape || !voxel) {
+    return null;
+  }
+
+  const dimensions = volumeDimensions();
+  return new THREE.Vector3(
+    ((voxel.x / Math.max(1, shape.x - 1)) - 0.5) * dimensions.x,
+    -((voxel.y / Math.max(1, shape.y - 1)) - 0.5) * dimensions.y,
+    ((voxel.z / Math.max(1, shape.z - 1)) - 0.5) * dimensions.z
+  );
+}
+
+function projectedViewerPosition(detection) {
+  const worldPosition = detectionWorldPosition(detection);
+  if (!worldPosition) {
+    return null;
+  }
+
+  volumeGroup.updateMatrixWorld();
+  worldPosition.applyMatrix4(volumeGroup.matrixWorld);
+  const projected = worldPosition.project(camera);
+  if (projected.z < -1 || projected.z > 1) {
+    return null;
+  }
+
+  const rect = elements.viewer.getBoundingClientRect();
+  return {
+    x: (projected.x * 0.5 + 0.5) * rect.width,
+    y: (-projected.y * 0.5 + 0.5) * rect.height
+  };
+}
+
+function selectedAnnotationDetections() {
+  if (state.selectedDetection) {
+    return [state.selectedDetection];
+  }
+  if (!state.selectedMolecule) {
+    return [];
+  }
+
+  return state.detections
+    .filter((detection) => (detection.molecule || detection.type) === state.selectedMolecule)
+    .slice(0, annotationLimit);
+}
+
+function syncViewerAnnotations() {
+  if (!elements.annotations) {
+    return;
+  }
+
+  const detections = selectedAnnotationDetections();
+  elements.annotations.replaceChildren();
+  annotationItems = detections.map((detection, index) => {
+    const annotation = document.createElement("button");
+    annotation.type = "button";
+    annotation.className = `viewer-annotation${state.selectedDetection ? " is-single" : ""}`;
+    annotation.style.setProperty("--annotation-color", detection.color || "#0b7f83");
+    annotation.dataset.detectionId = detection.id;
+    const dot = document.createElement("span");
+    dot.className = "viewer-annotation-dot";
+    dot.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.className = "viewer-annotation-text";
+    text.textContent = state.selectedDetection ? detection.type : `${index + 1}`;
+    annotation.append(dot, text);
+    annotation.addEventListener("click", () => selectDetection(detection.id));
+    elements.annotations.append(annotation);
+    return { detection, element: annotation };
+  });
+
+  updateAnnotationPositions();
+}
+
+function updateAnnotationPositions() {
+  if (!annotationItems.length) {
+    return;
+  }
+
+  annotationItems.forEach(({ detection, element }) => {
+    const position = projectedViewerPosition(detection);
+    if (!position) {
+      element.hidden = true;
+      return;
+    }
+
+    element.hidden = false;
+    element.style.transform = `translate(${position.x + 10}px, ${position.y - 14}px)`;
+  });
 }
 
 function colorizedScanRgb(value) {
@@ -360,111 +409,6 @@ function createColorizedSliceData(axis, bytes, width, height) {
   });
 
   return textureData;
-}
-
-function vivLayerProps() {
-  return {
-    id: "qbi-viv-volume",
-    loader: vivLoader,
-    contrastLimits: [[-0.00004, 0.00002]],
-    domain: [[-0.0001, 0.0001]],
-    colors: [[255, 226, 168]],
-    channelsVisible: [true],
-    selections: [{}],
-    resolution: Math.max(0, vivLoader.length - 1),
-    xSlice: sliceInterval("x"),
-    ySlice: sliceInterval("y"),
-    zSlice: sliceInterval("z"),
-    useProgressIndicator: false,
-    useWebGL1Warning: false
-  };
-}
-
-function updateVivLayers() {
-  if (!vivDeck || !vivLoader || !state.vivActive) {
-    return;
-  }
-
-  vivDeck.setProps({
-    layers: [
-      new VolumeLayer(vivLayerProps())
-    ]
-  });
-}
-
-function disableVivViewer() {
-  state.vivActive = false;
-  vivContainer.hidden = true;
-  renderer.domElement.hidden = false;
-  if (vivDeck) {
-    vivDeck.finalize();
-    vivDeck = null;
-  }
-  vivLoader = null;
-  vivView = null;
-  vivViewState = null;
-}
-
-async function setupVivViewer() {
-  if (!scanSupportsViv()) {
-    disableVivViewer();
-    return false;
-  }
-
-  const rect = elements.viewer.getBoundingClientRect();
-  const width = Math.max(1, Math.round(rect.width));
-  const height = Math.max(1, Math.round(rect.height));
-
-  try {
-    const { data } = await loadOmeZarr(scanPathToVivUrl(state.selectedScan), { type: "multiscales" });
-    vivLoader = data;
-    vivViewState = {
-      ...getDefaultInitialViewState(vivLoader, { width, height }, 1, true),
-      id: "3d",
-      rotationX: 25,
-      rotationOrbit: 35
-    };
-    vivView = new VolumeView({
-      id: "3d",
-      width,
-      height,
-      target: vivViewState.target,
-      useFixedAxis: false
-    });
-
-    if (vivDeck) {
-      vivDeck.finalize();
-    }
-
-    clearGroup(volumeGroup);
-    sliceAxes.forEach((axis) => {
-      slicePlaneObjects[axis] = null;
-    });
-    renderer.domElement.hidden = true;
-    vivContainer.hidden = false;
-    state.vivActive = true;
-    vivDeck = new Deck({
-      parent: vivContainer,
-      width,
-      height,
-      views: [vivView.getDeckGlView()],
-      viewState: { "3d": vivViewState },
-      controller: true,
-      useDevicePixels: false,
-      onViewStateChange: ({ viewState }) => {
-        vivViewState = { ...viewState, id: "3d" };
-        vivDeck?.setProps({ viewState: { "3d": vivViewState } });
-      },
-      layers: [
-        new VolumeLayer(vivLayerProps())
-      ]
-    });
-    return true;
-  } catch (error) {
-    console.warn("Viv viewer failed; falling back to Three.js slice planes.", error);
-    disableVivViewer();
-    return false;
-  }
 }
 
 function clearGroup(group) {
@@ -802,7 +746,6 @@ function drawColorizedCanvas(axis, canvas, bytes, width, height) {
 function drawMainSlice(axis, bytes, width, height, renderedLevel, renderedIndex) {
   drawColorizedCanvas(axis, mainSliceCanvas, bytes, width, height);
   elements.message.hidden = true;
-  elements.pointCount.textContent = `${axis.toUpperCase()} slice L${renderedLevel} ${renderedIndex}`;
 }
 
 function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedIndex) {
@@ -812,7 +755,9 @@ function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedInd
   }
 
   drawColorizedCanvas(axis, canvas, bytes, width, height);
-  elements.sliceLabels[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]} | L${renderedLevel} ${renderedIndex}`;
+  if (elements.sliceLabels[axis]) {
+    elements.sliceLabels[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]} | L${renderedLevel} ${renderedIndex}`;
+  }
 }
 
 function refreshSlicePreviews() {
@@ -1061,14 +1006,13 @@ function selectMoleculeGroup(molecule) {
   if (group) {
     showMoleculeGroupInfo(group);
   }
-
-  updateVivLayers();
+  syncViewerAnnotations();
 }
 
 function clearMoleculeSelection() {
   state.selectedMolecule = null;
   state.selectedDetection = null;
-  updateVivLayers();
+  syncViewerAnnotations();
   renderDetectionList();
 }
 
@@ -1083,8 +1027,7 @@ function selectDetection(id) {
   state.expandedMolecules.add(state.selectedMolecule);
 
   showPickInfo(detection);
-
-  updateVivLayers();
+  syncViewerAnnotations();
   renderDetectionList();
 }
 
@@ -1208,17 +1151,15 @@ async function loadPreview() {
   sliceAxes.forEach((axis) => {
     elements.sliceSliders[axis].max = String(Math.max(0, state.sliceShape[axis] - 1));
     elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
-    elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
+    setSliceSliderValue(axis);
   });
 
-  const usingViv = await setupVivViewer();
-  if (!usingViv) {
-    renderVolumeScene(payload);
-  }
+  renderVolumeScene(payload);
   const initialGroups = getMoleculeGroups();
   if (initialGroups.length > 0) {
     state.expandedMolecules.add(initialGroups[0].molecule);
   }
+  syncViewerAnnotations();
   renderDetectionList();
   renderAnalysis(payload.analysis);
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
@@ -1228,9 +1169,6 @@ async function loadPreview() {
   controls.target.set(0, 0, 0);
   controls.update();
 
-  elements.shape.textContent = `${payload.shape.x} x ${payload.shape.y} x ${payload.shape.z}`;
-  elements.range.textContent = `${payload.stats.min.toFixed(3)} to ${payload.stats.max.toFixed(3)}`;
-  elements.stride.textContent = `${payload.stats.stride}`;
   setProgress(100);
   setStatus("Ready", false);
 }
@@ -1375,13 +1313,10 @@ function scheduleInteractiveSlice(axis) {
 }
 
 function renderSlice(axis, slice) {
-  if (!state.vivActive) {
-    updateVolumeSlicePlane(axis, slice.bytes, slice.width, slice.height);
-  }
+  updateVolumeSlicePlane(axis, slice.bytes, slice.width, slice.height);
   elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
-  elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
+  setSliceSliderValue(axis);
   drawSlicePreview(axis, slice.bytes, slice.width, slice.height, slice.renderedLevel, slice.renderedIndex);
-  elements.pointCount.textContent = `${axis.toUpperCase()} slice L${slice.renderedLevel} ${slice.renderedIndex}`;
 }
 
 async function loadSlice(axis = "z", options = {}) {
@@ -1509,11 +1444,8 @@ async function uploadLabelsFolder() {
   }
 
   sliceCache.clear();
-  if (state.vivActive) {
-    updateVivLayers();
-  } else {
-    renderVolumeScene(state.volume);
-  }
+  renderVolumeScene(state.volume);
+  syncViewerAnnotations();
   renderDetectionList();
   renderAnalysis(payload.analysis);
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
@@ -1589,6 +1521,7 @@ function animate() {
     volumeGroup.rotation.z += 0.002;
   }
   controls.update();
+  updateAnnotationPositions();
   renderer.render(scene, camera);
 }
 
@@ -1604,27 +1537,10 @@ elements.upload.addEventListener("change", () => uploadZarrFolder().catch(showEr
 elements.labelsUpload.addEventListener("change", () => uploadLabelsFolder().catch(showError));
 elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch(showError));
 elements.resetCamera.addEventListener("click", () => {
-  if (state.vivActive && vivDeck && vivLoader) {
-    const rect = elements.viewer.getBoundingClientRect();
-    vivViewState = {
-      ...getDefaultInitialViewState(vivLoader, { width: rect.width, height: rect.height }, 1, true),
-      id: "3d",
-      rotationX: 25,
-      rotationOrbit: 35
-    };
-    vivDeck.setProps({ viewState: { "3d": vivViewState } });
-    return;
-  }
   camera.position.set(1.55, 1.25, 1.65);
   controls.target.set(0, 0, 0);
   controls.update();
 });
-elements.rotateToggle.addEventListener("click", () => {
-  state.autoRotate = !state.autoRotate;
-  elements.rotateToggle.classList.toggle("is-active", state.autoRotate);
-});
-elements.openSlicer.addEventListener("click", () => openSelectedScanInSlicer().catch(showError));
-elements.reloadScan.addEventListener("click", () => loadPreview().catch(showError));
 elements.showAllBtn.addEventListener("click", clearMoleculeSelection);
 sliceAxes.forEach((axis) => {
   elements.sliceSliders[axis].addEventListener("input", () => {
@@ -1632,10 +1548,10 @@ sliceAxes.forEach((axis) => {
       return;
     }
     state.currentSlices[axis] = Number(elements.sliceSliders[axis].value);
-    elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
+    setSliceSliderValue(axis);
     setActiveSliceAxis(axis);
     updateSliceSeams();
-    updateVivLayers();
+    updateAnnotationPositions();
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });

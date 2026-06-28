@@ -30,11 +30,6 @@ body {
     #eef2f3;
 }
 
-.test3d-body {
-  overflow: hidden;
-  background: #111518;
-}
-
 button,
 input,
 select {
@@ -43,44 +38,6 @@ select {
 
 button {
   cursor: pointer;
-}
-
-.test3d-shell {
-  min-height: 100vh;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-}
-
-.test3d-header {
-  min-height: 76px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  padding: 16px clamp(16px, 3vw, 34px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
-  background: #f8fbfb;
-}
-
-.test3d-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-.test3d-viewer-panel {
-  position: relative;
-  min-height: 0;
-  background: #07090a;
-}
-
-#test3d-canvas {
-  width: 100%;
-  height: 100%;
-  display: block;
-  outline: none;
 }
 
 .app-header {
@@ -122,16 +79,14 @@ h2 {
   font-size: 1rem;
 }
 
-.header-actions,
-.tool-buttons {
+.header-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
 .primary-action,
-.icon-button,
-.tool-buttons button {
+.icon-button {
   min-height: 40px;
   border: 1px solid var(--line-strong);
   border-radius: 7px;
@@ -147,14 +102,59 @@ h2 {
   color: #ffffff;
 }
 
-.icon-button,
-.tool-buttons button {
+.icon-button {
   width: 40px;
   padding: 0;
 }
 
+.slice-toolbar {
+  flex: 1;
+  min-width: min(100%, 620px);
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(320px, 1fr);
+  align-items: center;
+  justify-content: end;
+  gap: 12px;
+}
+
+.slice-preview-strip {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(66px, 1fr));
+  gap: 8px;
+}
+
+.slice-preview-tile {
+  min-width: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.slice-preview-canvas {
+  width: 100%;
+  height: 54px;
+  display: block;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: #172026;
+  image-rendering: pixelated;
+  object-fit: contain;
+}
+
+.slice-preview-tile figcaption {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .slice-slider-stack {
-  width: clamp(220px, 27vw, 360px);
+  width: 100%;
   display: grid;
   gap: 6px;
 }
@@ -163,7 +163,7 @@ h2 {
   width: 100%;
   min-height: 30px;
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr);
+  grid-template-columns: minmax(74px, auto) minmax(120px, 1fr);
   align-items: center;
   gap: 10px;
   padding: 0 8px;
@@ -172,12 +172,84 @@ h2 {
   background: var(--surface);
 }
 
-.slice-slider-control span {
-  min-width: 36px;
+.slice-axis-label {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   color: var(--ink);
   font-size: 0.78rem;
   font-weight: 800;
   white-space: nowrap;
+}
+
+.slice-slider-number {
+  min-width: 32px;
+}
+
+.slice-axis-box {
+  position: relative;
+  width: 28px;
+  height: 22px;
+  flex: 0 0 auto;
+  border: 2px solid currentColor;
+  border-radius: 4px;
+  background:
+    linear-gradient(rgba(23, 32, 38, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(23, 32, 38, 0.08) 1px, transparent 1px),
+    rgba(255, 255, 255, 0.78);
+  background-size: 8px 8px;
+}
+
+.slice-axis-box::before {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.18;
+}
+
+.axis-x {
+  color: #b9221a;
+}
+
+.axis-x .slice-axis-box::after,
+.axis-y .slice-axis-box::after,
+.axis-z .slice-axis-box::after {
+  content: "";
+  position: absolute;
+  background: currentColor;
+}
+
+.axis-x .slice-axis-box::after {
+  top: 2px;
+  bottom: 2px;
+  left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+}
+
+.axis-y {
+  color: #17733b;
+}
+
+.axis-y .slice-axis-box::after {
+  left: 2px;
+  right: 2px;
+  top: 50%;
+  height: 3px;
+  transform: translateY(-50%);
+}
+
+.axis-z {
+  color: #245fb8;
+}
+
+.axis-z .slice-axis-box::after {
+  inset: 5px;
+  border-radius: 2px;
+  opacity: 0.86;
 }
 
 .slice-slider-control input {
@@ -415,6 +487,12 @@ input[type="range"] {
   background: #f8fbfb;
 }
 
+.volume-canvas > canvas,
+.volume-canvas .main-slice-canvas {
+  position: relative;
+  z-index: 1;
+}
+
 .volume-canvas canvas {
   display: block;
   width: 100%;
@@ -423,20 +501,6 @@ input[type="range"] {
 
 .volume-canvas canvas[hidden] {
   display: none;
-}
-
-.volume-canvas .viv-volume-viewer {
-  position: absolute;
-  inset: 0;
-}
-
-.volume-canvas .viv-volume-viewer[hidden] {
-  display: none;
-}
-
-.volume-canvas .viv-volume-viewer canvas {
-  width: 100% !important;
-  height: 100% !important;
 }
 
 .volume-canvas .main-slice-canvas {
@@ -502,10 +566,66 @@ input[type="range"] {
   display: none;
 }
 
-.tool-buttons button.is-active {
-  border-color: var(--teal);
-  background: #dbf3ed;
-  color: var(--teal-dark);
+.viewer-annotations {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.viewer-annotation {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(180px, calc(100% - 24px));
+  min-height: 28px;
+  padding: 5px 8px 5px 6px;
+  border: 1px solid rgba(23, 32, 38, 0.18);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #172026;
+  box-shadow: 0 10px 24px rgba(23, 32, 38, 0.16);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  pointer-events: auto;
+  transform-origin: left top;
+}
+
+.viewer-annotation::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 13px;
+  width: 10px;
+  height: 1px;
+  background: var(--annotation-color);
+}
+
+.viewer-annotation-dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--annotation-color);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.8);
+}
+
+.viewer-annotation-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-annotation.is-single {
+  max-width: min(260px, calc(100% - 24px));
+  min-height: 34px;
+  padding: 7px 10px 7px 8px;
+  font-size: 12px;
 }
 
 .volume-label {
@@ -1000,19 +1120,19 @@ canvas.slice-preview {
     flex-direction: column;
   }
 
-  .tool-buttons {
+  .slice-toolbar {
     width: 100%;
     display: grid;
-    grid-template-columns: 40px 1fr 40px 40px;
+    grid-template-columns: 1fr;
     align-items: center;
-  }
-
-  .tool-buttons button {
-    width: 100%;
   }
 
   .slice-slider-stack,
   .slice-slider-control {
     width: 100%;
+  }
+
+  .slice-preview-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
