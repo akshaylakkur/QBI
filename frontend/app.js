@@ -697,39 +697,9 @@ function applyOcclusionFilter() {
 
 function syncPickOverlays() {
   clearGroup(picksGroup);
-  if (!state.detections.length) {
-    return;
-  }
-
-  state.detections.forEach((detection) => {
-    // Keep overlays tied to active cross-sections only.
-    if (visibleSliceAxesForDetection(detection).length === 0) {
-      return;
-    }
-    const position = detectionWorldPosition(detection);
-    if (!position) {
-      return;
-    }
-
-    const visible = passesOcclusionFilter(detection);
-    const radius = Math.max(0.008, moleculeRadiusWorld(detection) * 0.55);
-    const [r, g, b] = detectionColorArray(detection);
-    const color = new THREE.Color(r / 255, g / 255, b / 255);
-    const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(radius, 14, 14),
-      new THREE.MeshStandardMaterial({
-        color,
-        emissive: color.clone().multiplyScalar(visible ? 0.22 : 0),
-        emissiveIntensity: visible ? 0.35 : 0,
-        transparent: true,
-        opacity: visible ? 0.62 : 0.05,
-        depthWrite: false
-      })
-    );
-    mesh.position.copy(position);
-    mesh.userData.detectionId = detection.id;
-    picksGroup.add(mesh);
-  });
+  // Pick markers live on the slice plane textures (createColorizedSliceData), not as
+  // floating 3D spheres. bf_aesthetics_graph never used picksGroup; the crowding merge
+  // added spheres at detectionWorldPosition which made every pick visible in the volume.
 }
 
 function exportCleanCopickPicks() {
@@ -2946,6 +2916,7 @@ sliceAxes.forEach((axis) => {
     } else {
       updateAnnotationPositions();
     }
+    syncPickOverlays();
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });
