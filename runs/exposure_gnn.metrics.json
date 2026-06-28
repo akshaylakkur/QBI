@@ -1,0 +1,75 @@
+{
+  "device": "cpu",
+  "pretrain": {
+    "graphs": 343,
+    "pretrain_val_mae": 0.03414326533675194,
+    "pretrain_val_r2": 0.9196341633796692,
+    "synthetic_seconds": 92.5,
+    "synthetic_nodes": 50107
+  },
+  "loto": {
+    "folds": [
+      {
+        "holdout": "TS_5_4",
+        "gnn_mae": 0.04173780605196953,
+        "gnn_r2": 0.5088921189308167,
+        "ridge_mae": 0.042958565056324005,
+        "ridge_r2": 0.683445930480957,
+        "gnn_beats_ridge": true
+      },
+      {
+        "holdout": "TS_69_2",
+        "gnn_mae": 0.026553936302661896,
+        "gnn_r2": 0.7840974926948547,
+        "ridge_mae": 0.04486370459198952,
+        "ridge_r2": 0.42259544134140015,
+        "gnn_beats_ridge": true
+      },
+      {
+        "holdout": "TS_6_4",
+        "gnn_mae": 0.033811330795288086,
+        "gnn_r2": 0.825657069683075,
+        "ridge_mae": 0.03125779703259468,
+        "ridge_r2": 0.8548020720481873,
+        "gnn_beats_ridge": false
+      },
+      {
+        "holdout": "TS_6_6",
+        "gnn_mae": 0.027223240584135056,
+        "gnn_r2": 0.6920896768569946,
+        "ridge_mae": 0.04031027853488922,
+        "ridge_r2": 0.5915663242340088,
+        "gnn_beats_ridge": true
+      },
+      {
+        "holdout": "TS_73_6",
+        "gnn_mae": 0.03348705545067787,
+        "gnn_r2": 0.6882957220077515,
+        "ridge_mae": 0.037039581686258316,
+        "ridge_r2": 0.676250696182251,
+        "gnn_beats_ridge": true
+      },
+      {
+        "holdout": "TS_86_3",
+        "gnn_mae": 0.03164210543036461,
+        "gnn_r2": 0.8051174879074097,
+        "ridge_mae": 0.03953764587640762,
+        "ridge_r2": 0.7192935943603516,
+        "gnn_beats_ridge": true
+      },
+      {
+        "holdout": "TS_99_9",
+        "gnn_mae": 0.03113582357764244,
+        "gnn_r2": 0.7460101842880249,
+        "ridge_mae": 0.03405531868338585,
+        "ridge_r2": 0.730611264705658,
+        "gnn_beats_ridge": true
+      }
+    ],
+    "loto_gnn_mae_mean": 0.032227328313248496,
+    "loto_gnn_mae_std": 0.004679855041398869,
+    "loto_ridge_mae_mean": 0.03857469878026417,
+    "loto_ridge_mae_std": 0.004456581232263505,
+    "gnn_wins": 6
+  }
+}

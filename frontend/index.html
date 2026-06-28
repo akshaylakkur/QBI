@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CryoSight</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 196 40" fill="none" role="img" aria-label="CryoSight" class="app-logo">
+          <defs>
+            <linearGradient id="csg" x1="0" y1="0" x2="1" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stop-color="#14d0d0"/>
+              <stop offset="100%" stop-color="#0b8a8b"/>
+            </linearGradient>
+            <filter id="csglow" x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur in="SourceGraphic" stdDeviation="1" result="b"/>
+              <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+          <path d="M2,20 Q22,4 42,20 Q22,36 2,20 Z"
+                stroke="url(#csg)" stroke-width="1.5" fill="rgba(14,165,166,0.07)" filter="url(#csglow)"/>
+          <circle cx="22" cy="20" r="8.5" stroke="url(#csg)" stroke-width="1.4" fill="none" filter="url(#csglow)"/>
+          <g transform="translate(22,20)" stroke="#0ea5a6" stroke-width="1.1" stroke-linecap="round" opacity="0.82">
+            <line x1="0" y1="-8.5" x2="0" y2="-12"/>
+            <line x1="0" y1="8.5" x2="0" y2="12"/>
+            <line x1="7.36" y1="-4.25" x2="10.39" y2="-6"/>
+            <line x1="-7.36" y1="-4.25" x2="-10.39" y2="-6"/>
+            <line x1="7.36" y1="4.25" x2="10.39" y2="6"/>
+            <line x1="-7.36" y1="4.25" x2="-10.39" y2="6"/>
+          </g>
+          <circle cx="22" cy="20" r="4" fill="#0ea5a6" filter="url(#csglow)"/>
+          <circle cx="22" cy="20" r="1.8" fill="#7df4f4"/>
+          <text y="28" font-size="20" letter-spacing="-0.5">
+            <tspan x="50" font-weight="700" fill="#0ea5a6">Cryo</tspan><tspan font-weight="300" fill="#64748b">Sight</tspan>
+          </text>
+        </svg>
+      </div>
+      <div class="header-actions" aria-label="Project actions">
+        <button id="reset-camera" class="icon-button" type="button" aria-label="Reset 3D view">0</button>
+        <button class="primary-action" type="button">Export Report</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar" aria-label="Upload and scan controls">
+        <section class="panel upload-panel">
+          <div class="panel-heading">
+            <h2>Scan source</h2>
+            <div class="status-row">
+              <span id="load-status" class="status-pill">Starting</span>
+              <span id="qa-status" class="status-pill qa-pill" hidden>QA</span>
+            </div>
+          </div>
+          <p id="qa-detail" class="qa-detail" hidden></p>
+
+          <label class="dropzone" for="zarr-upload">
+            <input id="zarr-upload" type="file" multiple webkitdirectory directory>
+            <span class="upload-icon" aria-hidden="true">+</span>
+            <strong>Upload a .zarr folder</strong>
+            <span>Folder uploads are stored by the web server, then opened like the sample scan.</span>
+          </label>
+
+          <div class="field-stack">
+            <label>
+              Local .zarr path
+              <span class="inline-field">
+                <input id="local-zarr-path" type="text" placeholder="/Users/name/path/to/scan.zarr">
+                <button id="open-local-zarr" type="button">Open</button>
+              </span>
+            </label>
+            <label>
+              Dataset
+              <select id="scan-select"></select>
+            </label>
+            <label>
+              Overlay color
+              <select id="overlay-color-mode">
+                <option value="type" selected>By molecule type</option>
+                <option value="clean">By clean extraction</option>
+                <option value="exposure">By steric exposure</option>
+              </select>
+            </label>
+            <label>
+              Upload labels
+              <input id="labels-upload" type="file" multiple webkitdirectory directory accept=".json,application/json">
+            </label>
+            <select id="level-select" hidden aria-hidden="true">
+              <option value="2" selected>Level 2 - fastest overview</option>
+              <option value="1">Level 1 - mid detail</option>
+              <option value="0">Level 0 - full resolution</option>
+            </select>
+            <input id="point-size" type="range" min="1" max="9" value="3" hidden aria-hidden="true">
+            <input id="point-limit" type="range" min="8000" max="80000" step="4000" value="38000" hidden aria-hidden="true">
+            <select id="stride-select" hidden aria-hidden="true">
+              <option value="1">1 - dense</option>
+              <option value="2" selected>2 - balanced</option>
+              <option value="3">3 - fast</option>
+              <option value="4">4 - very fast</option>
+            </select>
+          </div>
+
+          <div class="inference-section">
+            <button id="run-inference" type="button" class="inference-button">
+              <span class="inference-icon">▶</span>
+              Run Model Inference
+            </button>
+            <div id="inference-progress" class="inference-progress" hidden>
+              <div class="inference-progress-bar">
+                <span id="inference-progress-fill" class="inference-progress-fill"></span>
+              </div>
+              <span id="inference-status" class="inference-status-text">Starting...</span>
+            </div>
+            <button id="run-crowding" type="button" class="inference-button crowding-button" disabled>
+              <span class="inference-icon">◎</span>
+              Analyze Crowding
+            </button>
+            <div id="crowding-progress" class="inference-progress" hidden>
+              <div class="inference-progress-bar">
+                <span id="crowding-progress-fill" class="inference-progress-fill"></span>
+              </div>
+              <span id="crowding-status" class="inference-status-text">Starting...</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Volume</h2>
+            <span id="point-count" class="status-pill">0 points</span>
+          </div>
+          <div class="metric-list">
+            <div>
+              <span>Shape</span>
+              <strong id="volume-shape">-</strong>
+            </div>
+            <div>
+              <span>Intensity range</span>
+              <strong id="volume-range">-</strong>
+            </div>
+            <div>
+              <span>Sampling stride</span>
+              <strong id="volume-stride">-</strong>
+            </div>
+          </div>
+          <div class="progress-track" aria-label="Loading progress">
+            <span id="load-progress"></span>
+          </div>
+        </section>
+      </aside>
+
+      <section class="viewer-region" aria-label="3D volume and detection review">
+        <div class="viewer-row">
+        <section class="viewer-panel">
+          <div class="viewer-toolbar">
+            <div>
+              <p class="eyebrow">Interactive volume</p>
+              <h2 id="viewer-title">3D Cryo View</h2>
+            </div>
+            <div class="slice-toolbar" aria-label="Orthogonal slice controls">
+              <div class="slice-preview-strip" aria-label="Slice previews">
+                <figure class="slice-preview-tile axis-x">
+                  <canvas id="x-slice-canvas" class="slice-preview-canvas"></canvas>
+                  <figcaption id="x-slice-label">X -</figcaption>
+                </figure>
+                <figure class="slice-preview-tile axis-y">
+                  <canvas id="y-slice-canvas" class="slice-preview-canvas"></canvas>
+                  <figcaption id="y-slice-label">Y -</figcaption>
+                </figure>
+                <figure class="slice-preview-tile axis-z">
+                  <canvas id="z-slice-canvas" class="slice-preview-canvas"></canvas>
+                  <figcaption id="z-slice-label">Z -</figcaption>
+                </figure>
+              </div>
+              <div class="slice-slider-stack" aria-label="Orthogonal slice controls">
+                <label class="slice-slider-control" aria-label="X slice">
+                  <span class="slice-axis-label axis-x" aria-hidden="true">
+                    <span class="slice-axis-box"></span>
+                    <span id="x-slice-value" class="slice-slider-number">X -</span>
+                  </span>
+                  <input id="x-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+                <label class="slice-slider-control" aria-label="Y slice">
+                  <span class="slice-axis-label axis-y" aria-hidden="true">
+                    <span class="slice-axis-box"></span>
+                    <span id="y-slice-value" class="slice-slider-number">Y -</span>
+                  </span>
+                  <input id="y-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+                <label class="slice-slider-control" aria-label="Z slice">
+                  <span class="slice-axis-label axis-z" aria-hidden="true">
+                    <span class="slice-axis-box"></span>
+                    <span id="z-slice-value" class="slice-slider-number">Z -</span>
+                  </span>
+                  <input id="z-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div id="volume-viewer" class="volume-canvas" aria-label="Interactive 3D Zarr volume renderer">
+            <div id="viewer-message" class="viewer-message">Loading sample Zarr data</div>
+            <div id="viewer-annotations" class="viewer-annotations" aria-live="polite"></div>
+          </div>
+        </section>
+
+        <section id="graph-panel" class="panel graph-panel" hidden aria-label="Local neighborhood graph">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Crowding graph</p>
+              <h2 id="graph-pick-label">Neighborhood</h2>
+            </div>
+            <button id="reset-graph-camera" type="button" class="icon-button" aria-label="Reset graph view">↺</button>
+          </div>
+          <div id="graph-viewer" class="graph-canvas" aria-label="3D particle neighborhood graph"></div>
+          <p id="graph-caption" class="graph-caption">Run crowding analysis, then select a pick.</p>
+        </section>
+        </div>
+
+        <section class="review-grid">
+          <article class="panel detections-panel">
+            <div class="panel-heading">
+              <h2>Detected molecules</h2>
+              <div class="panel-heading-actions">
+                <span id="detection-count" class="status-pill">0 picks</span>
+                <button id="show-all-molecules" type="button" class="show-all-btn" hidden>Show all</button>
+              </div>
+            </div>
+            <div id="occlusion-filter-panel" class="occlusion-filter-panel" hidden>
+              <label class="occlusion-filter-label" for="occlusion-filter-slider">
+                <span>Clean extraction filter</span>
+                <strong id="occlusion-filter-value">0.00</strong>
+              </label>
+              <input id="occlusion-filter-slider" type="range" min="0" max="100" value="0" step="1" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+              <p id="occlusion-filter-stats" class="occlusion-filter-stats">Run crowding analysis to enable filtering.</p>
+              <button id="export-clean-picks" type="button" class="export-clean-picks-btn">Export Clean Copick Picks</button>
+            </div>
+            <div id="detection-list" class="detection-list"></div>
+          </article>
+
+          <article class="panel detail-panel">
+            <div class="panel-heading">
+              <h2>Dataset analysis</h2>
+              <span id="analysis-status" class="status-pill">Waiting for labels</span>
+            </div>
+            <div id="crowding-summary" class="crowding-summary" hidden></div>
+            <div id="analysis-summary" class="analysis-summary"></div>
+            <div id="analysis-report" class="analysis-report">
+              Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.
+            </div>
+            <div class="analysis-detail">
+              <div class="panel-heading analysis-detail-heading">
+                <h3>Selected molecule</h3>
+              </div>
+              <dl class="object-facts">
+                <div>
+                  <dt>ID</dt>
+                  <dd id="selected-id">-</dd>
+                </div>
+                <div>
+                  <dt>Type</dt>
+                  <dd id="selected-type">-</dd>
+                </div>
+                <div>
+                  <dt>Confidence</dt>
+                  <dd id="selected-confidence">-</dd>
+                </div>
+                <div>
+                  <dt>Position</dt>
+                  <dd id="selected-position">-</dd>
+                </div>
+                <div>
+                  <dt>Steric exposure</dt>
+                  <dd id="selected-exposure">-</dd>
+                </div>
+                <div>
+                  <dt>Clean extraction</dt>
+                  <dd id="selected-clean-extraction">-</dd>
+                </div>
+                <div>
+                  <dt>Anisotropy</dt>
+                  <dd id="selected-anisotropy">-</dd>
+                </div>
+                <div>
+                  <dt>Open direction</dt>
+                  <dd id="selected-open-direction">-</dd>
+                </div>
+                <div>
+                  <dt>GNN exposure</dt>
+                  <dd id="selected-gnn-exposure">-</dd>
+                </div>
+                <div>
+                  <dt>Neighbors</dt>
+                  <dd id="selected-neighbors">-</dd>
+                </div>
+                <div>
+                  <dt>Notes</dt>
+                  <dd id="selected-notes">-</dd>
+                </div>
+              </dl>
+            </div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.165.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
