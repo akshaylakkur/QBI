@@ -21,6 +21,7 @@ let sliceCacheBytes = 0;
 const maxSliceCacheBytes = 96 * 1024 * 1024;
 const localScans = new Map();
 const pickCache = new Map();
+const latestAggregation = new Map();
 
 // Inference progress tracking (SSE)
 const inferenceEmitters = new Map();
@@ -482,48 +483,128 @@ function normalizeInsightTone(value) {
 function buildStructuredFallbackAnalysis(aggregation) {
   if (!aggregation.items.length) {
     return {
-      title: "CryoET Object-Pick Label Summary",
-      headline: "No uploaded molecule labels were available for analysis.",
+      title: "CryoSight Analysis",
+      headline: "No molecule labels loaded.",
+      keywords: [],
       insights: [],
-      datasetSummary: "No uploaded molecule labels were available for analysis.",
+      spatialAnalysis: "",
+      biologicalContext: "",
+      datasetSummary: "No molecule label data was available for analysis.",
       caveats: [],
-      nextSteps: []
+      nextSteps: ["Load a Picks labels folder to generate molecule-level insights."]
     };
   }
 
   const dominant = aggregation.items[0];
-  return {
-    title: "CryoET Object-Pick Label Summary",
-    headline: `The dataset is dominated by ${dominant.label.toLowerCase()} picks, but clustering remains mostly sparse.`,
-    insights: aggregation.items.map((item) => ({
-      tone: item.difficulty === "easy" ? "positive" : item.difficulty.includes("hard") ? "warning" : "analytical",
-      label: `${item.label}: ${item.count.toLocaleString()} picks`,
-      text: `Represents ${item.frequencyPercent.toFixed(1)}% of the uploaded picks across ${item.clusterCount} clusters. Singleton clusters: ${item.singletonClusters}; largest cluster: ${item.largestClusterSize}.`,
+  const scored = aggregation.items.filter((i) => i.difficulty !== "impossible, not scored");
+  const easyItems = aggregation.items.filter((i) => i.difficulty === "easy");
+  const hardItems = aggregation.items.filter((i) => i.difficulty.includes("hard"));
+  const decoyItems = aggregation.items.filter((i) => i.difficulty === "impossible, not scored");
+  const vol = aggregation.volume?.dimensions;
+
+  const overallSingletonRate = aggregation.items.reduce(
+    (sum, i) => sum + (i.clusterCount > 0 ? i.singletonClusters / i.clusterCount : 0), 0
+  ) / aggregation.items.length;
+
+  const allSingleton = aggregation.items.every((i) => i.singletonClusters === i.clusterCount);
+  const maxClusterSize = Math.max(...aggregation.items.map((i) => i.largestClusterSize));
+
+  const keywords = [
+    `${dominant.label.toLowerCase().replace(/\s+/g, "-")}-dominant`,
+    overallSingletonRate > 0.95 ? "singleton-saturated" : overallSingletonRate > 0.7 ? "mostly-dispersed" : "clustered",
+    `${aggregation.totalPicks}-picks`,
+    `${aggregation.items.length}-class-annotation`,
+    hardItems.length > 0 ? "hard-class-uncertain" : null,
+    decoyItems.length > 0 ? "decoy-class-present" : null,
+    easyItems.length > 0 ? "easy-controls-detected" : null,
+    maxClusterSize > 2 ? `max-${maxClusterSize}-pick-cluster` : null
+  ].filter(Boolean);
+
+  const insights = aggregation.items.map((item) => {
+    const singletonRate = item.clusterCount > 0 ? item.singletonClusters / item.clusterCount : 0;
+    const isDecoy = item.difficulty === "impossible, not scored";
+    const isEasy = item.difficulty === "easy";
+    const isHard = item.difficulty.includes("hard");
+    const isDominant = item === dominant;
+
+    let tone, label, text;
+
+    if (isDecoy) {
+      tone = "serious";
+      label = `${item.label}: unscored decoy — excluded from competition metric`;
+      text = `Beta-amylase (${item.count} picks, ${item.frequencyPercent.toFixed(1)}%) is an intentional difficulty-calibration decoy not scored in the CZII challenge. Its ${item.clusterCount} fully isolated clusters confirm sample presence, but these picks carry no biological signal for scoring purposes and should not be used for inference.`;
+    } else if (isDominant && isEasy) {
+      tone = "positive";
+      label = `${item.label} dominates — reliable easy-class enrichment`;
+      text = `${item.label} is the most abundant annotated molecule at ${item.count} picks (${item.frequencyPercent.toFixed(1)}%). As an easy-class target, these detections carry high confidence. The ${(singletonRate * 100).toFixed(0)}% singleton rate across ${item.clusterCount} clusters indicates particles are spatially dispersed throughout the ${vol ? `${vol.z}×${vol.y}×${vol.x}` : "full"} voxel volume without preferential aggregation.`;
+    } else if (isHard && singletonRate >= 1.0) {
+      tone = "warning";
+      label = `${item.label}: hard-class with total spatial dispersal — annotation-uncertain`;
+      text = `All ${item.count} ${item.label} picks (${item.frequencyPercent.toFixed(1)}%) are fully isolated — 100% singleton rate within a ${item.clusterThresholdAngstroms.toFixed(0)}Å clustering threshold. For hard-class molecules, complete dispersal can reflect genuine biological scarcity, conservative annotation posture, or detection difficulty. Without replicate tomograms, these two explanations cannot be distinguished.`;
+    } else if (isEasy && singletonRate >= 1.0) {
+      tone = "analytical";
+      label = `${item.label}: easy-class fully dispersed, no co-localization`;
+      text = `${item.label} shows ${item.count} picks (${item.frequencyPercent.toFixed(1)}%), all as singletons within a ${item.clusterThresholdAngstroms.toFixed(0)}Å threshold. As an easy-class molecule, detection confidence is high — the all-singleton pattern suggests particles are genuinely well-separated in this tomogram without spatial preference or aggregation zones.`;
+    } else if (item.multiPickClusters > 0) {
+      tone = "analytical";
+      label = `${item.label}: ${item.multiPickClusters} co-localization cluster${item.multiPickClusters !== 1 ? "s" : ""} detected`;
+      text = `${item.label} (${item.count} picks, ${item.frequencyPercent.toFixed(1)}%) has ${item.multiPickClusters} clusters containing multiple picks, with the largest holding ${item.largestClusterSize} particles. This suggests ${item.multiPickClusters > 3 ? "notable spatial enrichment in specific subvolume regions" : "sparse but detectable co-localization"} alongside ${item.singletonClusters} isolated picks.`;
+    } else {
+      tone = "analytical";
+      label = `${item.label}: ${item.frequencyPercent.toFixed(1)}% share, fully dispersed`;
+      text = `${item.label} contributes ${item.count} picks (${item.frequencyPercent.toFixed(1)}% of total) across ${item.clusterCount} singleton clusters within a ${item.clusterThresholdAngstroms.toFixed(0)}Å spatial threshold. No particle aggregation was detected.`;
+    }
+
+    return {
+      tone,
+      label,
+      text,
       evidence: [
-        `${item.count.toLocaleString()} picks`,
-        `${item.frequencyPercent.toFixed(1)}% frequency`,
-        `${item.clusterCount} clusters`
+        `${item.count} picks · ${item.frequencyPercent.toFixed(1)}%`,
+        `${item.clusterCount} clusters · ${(singletonRate * 100).toFixed(0)}% singletons`,
+        item.largestClusterSize > 1 ? `largest cluster: ${item.largestClusterSize} picks` : "all isolated"
       ]
-    })),
-    datasetSummary: `The uploaded labels contain ${aggregation.totalPicks.toLocaleString()} curated molecule picks across ${aggregation.items.length} molecular classes, spanning a volume of ${aggregation.volume?.dimensions?.z || 0} × ${aggregation.volume?.dimensions?.y || 0} × ${aggregation.volume?.dimensions?.x || 0} voxels.`,
+    };
+  });
+
+  const spatialAnalysis = allSingleton
+    ? `All ${aggregation.totalPicks} picks across all ${aggregation.items.length} molecule classes are fully singleton-clustered — every annotated particle is spatially isolated within its class-specific distance threshold. This near-total singleton pattern (${(overallSingletonRate * 100).toFixed(0)}% average) means no co-localization between same-class particles was detected anywhere in the ${vol ? `${vol.z}×${vol.y}×${vol.x}` : ""} voxel volume. For easy-class molecules this is a robust biological observation; for hard-class molecules it may additionally reflect annotation conservatism. No evidence of multi-particle complexes or spatially enriched regions was found in this volume.`
+    : `The spatial distribution is heterogeneous across classes. Classes with multi-pick clusters (${aggregation.items.filter((i) => i.multiPickClusters > 0).map((i) => i.label).join(", ")}) show localized particle enrichment, while others remain fully dispersed. The largest cluster in the dataset contains ${maxClusterSize} picks, suggesting at least one region of local particle concentration. The overall singleton rate of ${(overallSingletonRate * 100).toFixed(0)}% indicates that most particles across all classes are non-aggregated.`;
+
+  const biologicalContext = `This tomogram contains the standard CZII challenge molecule panel. Ribosome abundance is consistent with active translation machinery; apo-ferritin serves as a structural marker with well-characterized detectability. Thyroglobulin and beta-galactosidase at lower frequencies are expected given their harder detection profiles and smaller expected copy numbers. The absence of multi-particle clusters may indicate a sample fixed prior to complex formation, or simply reflects the density at this particular tomographic position. Cross-tomogram comparison is required before drawing sample-level biological conclusions.`;
+
+  return {
+    title: "CryoSight Dataset Analysis",
+    headline: `${aggregation.totalPicks} picks across ${scored.length} scored class${scored.length !== 1 ? "es" : ""} — ${overallSingletonRate > 0.95 ? "singleton-saturated: no particle aggregation detected" : overallSingletonRate > 0.7 ? "predominantly dispersed with sparse co-localization" : "clustered distribution with multi-particle zones"}.`,
+    keywords,
+    insights,
+    spatialAnalysis,
+    biologicalContext,
+    datasetSummary: `Tomogram dimensions: ${vol ? `${vol.z}×${vol.y}×${vol.x} voxels` : "unknown"} at ${aggregation.volume?.voxelSpacing?.x || "?"}Å/voxel. Total annotated picks: ${aggregation.totalPicks} across ${aggregation.items.length} molecule classes (${decoyItems.length} unscored decoy). Dominant class: ${dominant.label} at ${dominant.frequencyPercent.toFixed(1)}%. All-singleton classes: ${aggregation.items.filter((i) => i.singletonClusters === i.clusterCount).map((i) => i.label).join(", ") || "none"}. Classes with co-localization: ${aggregation.items.filter((i) => i.multiPickClusters > 0).map((i) => `${i.label} (${i.multiPickClusters} multi-pick clusters)`).join(", ") || "none"}.`,
     caveats: [
-      "This is one tomographic volume, so the result is descriptive rather than generalizable.",
-      "High singleton rates can reflect true sparsity, annotation fragmentation, or boundary effects."
-    ],
+      "Results derive from one tomographic volume and cannot be generalized to population-level conclusions without replicate data.",
+      overallSingletonRate > 0.9 ? "The high singleton rate may reflect conservative annotation practices or fixed-step particle picking, not necessarily true biological dispersal." : "Multi-pick clusters may arise from close particle packing or annotation overlap.",
+      hardItems.length > 0 ? `Hard-class molecules (${hardItems.map((i) => i.label).join(", ")}) carry higher detection uncertainty; their spatial patterns should be interpreted with additional caution.` : null,
+      "Beta-amylase picks are not scored in the CZII challenge — exclude from any scoring or biological frequency comparisons."
+    ].filter(Boolean),
     nextSteps: [
-      "Compare against matched controls or replicate volumes before making biological claims.",
-      "Use the cluster structure to inspect whether the same molecule repeatedly accumulates in the same subregions."
-    ]
+      "Compare pick frequencies and singleton rates across multiple tomograms from the same experiment run before making biological claims.",
+      "Inspect hard-class singleton clusters (beta-galactosidase, thyroglobulin) manually to assess annotation consistency.",
+      hardItems.some((i) => i.multiPickClusters > 0) ? "Examine the multi-pick clusters in hard-class molecules — these are the most likely true positive detections for difficult targets." : "Consider lowering cluster thresholds for hard-class molecules to test sensitivity vs. specificity tradeoffs.",
+      "Cross-reference ribosome cluster positions with expected membrane-proximal translation zones if membrane segmentation is available."
+    ].filter(Boolean)
   };
 }
 
 function buildClaudeAnalysisInput(aggregation) {
+  const maxItems = 12;
+  const maxClustersPerItem = 8;
   return {
     volume: aggregation.volume,
     totalPicks: aggregation.totalPicks,
     totalClusters: aggregation.totalClusters,
     jsonFiles: aggregation.jsonFiles,
-    items: aggregation.items.map((item) => ({
+    items: aggregation.items.slice(0, maxItems).map((item) => ({
       molecule: item.molecule,
       label: item.label,
       difficulty: item.difficulty,
@@ -534,7 +615,9 @@ function buildClaudeAnalysisInput(aggregation) {
       singletonClusters: item.singletonClusters,
       multiPickClusters: item.multiPickClusters,
       largestClusterSize: item.largestClusterSize,
-      clusters: item.clusters.map((cluster) => ({
+      clustersShown: Math.min(item.clusters.length, maxClustersPerItem),
+      clustersTotal: item.clusters.length,
+      clusters: item.clusters.slice(0, maxClustersPerItem).map((cluster) => ({
         id: cluster.id,
         count: cluster.count,
         centroid: {
@@ -561,41 +644,54 @@ function buildClaudeAnalysisInput(aggregation) {
 
 function buildClaudeSystemPrompt() {
   return [
-    "You analyze CryoET object-pick label summaries for research triage.",
-    "Be scientifically cautious but still useful.",
-    "Use the supplied cluster and frequency statistics to generate hypothesis-level interpretations, not certainty.",
-    "Do not claim clinical, mechanistic, or drug-response conclusions from a single uploaded label folder.",
-    "If a pattern is only suggestive, say it is suggestive and explain why.",
-    "Do not repeat the molecule name as the only label; produce interpretive labels such as high frequency, sparse clustering, possible enrichment, or cautionary exclusion.",
-    "Where a broad biological implication is plausible, mention it as a hypothesis only and tie it directly to the observed clustering or frequency pattern.",
-    "Do not force disease or metabolism claims when the data does not support them.",
-    "Use four tone tags exactly: positive, analytical, warning, serious.",
-    "Positive means a constructive signal or robust pattern.",
-    "Analytical means a neutral measurement-based observation.",
-    "Warning means a caveat, ambiguity, or potential artifact.",
-    "Serious means exclusion, a strong caution, or an important limitation.",
-    "Return valid JSON only. Do not use markdown fences.",
-    "Required JSON shape: {\"title\": string, \"headline\": string, \"insights\": [{\"tone\": string, \"label\": string, \"text\": string, \"evidence\": [string]}], \"datasetSummary\": string, \"caveats\": [string], \"nextSteps\": [string]}",
-    "Keep the output concise but substantive."
+    "You are a CryoET data scientist. Analyze particle pick data from one cryo-electron tomography volume.",
+    "Every claim must cite specific numbers from the input. No generic filler text.",
+    "INSIGHT LABELS: describe a biological pattern or data quality finding — never 'MoleculeName: N picks'.",
+    "Good labels: 'Ribosome dominates with singleton-only dispersal', 'Apo-ferritin: easy-class positive control at 100% isolation', 'Beta-galactosidase hard-class signal is annotation-uncertain'.",
+    "Singleton rate = singletonClusters / clusterCount. 100% singleton = every annotated particle is spatially isolated, no co-localization.",
+    "Easy-class: apo-ferritin, ribosome, VLP — high detection confidence. Hard-class: beta-galactosidase, thyroglobulin — 100% singleton may reflect annotation difficulty, not biology.",
+    "Beta-amylase is UNSCORED DECOY — intentional calibration class, excluded from competition metric. Mark tone=serious.",
+    "Tones allowed: positive, analytical, warning, serious.",
+    "Return ONLY valid compact JSON — no markdown fences, no prose, no trailing commas, no newlines inside string values.",
+    "Schema (keep arrays short — max 5 keywords, max 5 insights, max 3 caveats, max 3 nextSteps, max 2 evidence items per insight):",
+    "{\"title\":string,\"headline\":string,\"keywords\":[string],\"insights\":[{\"tone\":string,\"label\":string,\"text\":string,\"evidence\":[string]}],\"spatialAnalysis\":string,\"biologicalContext\":string,\"caveats\":[string],\"nextSteps\":[string]}"
   ].join(" ");
 }
 
 function buildClaudeUserPrompt(aggregation) {
   const input = buildClaudeAnalysisInput(aggregation);
+
+  const derived = input.items.map((item) => {
+    const singletonPct = item.clusterCount > 0
+      ? ((item.singletonClusters / item.clusterCount) * 100).toFixed(1)
+      : "0.0";
+    return `  ${item.label} (${item.difficulty}): ${item.count} picks · ${item.frequencyPercent.toFixed(1)}% · ${item.clusterCount} clusters · ${singletonPct}% singleton rate · largest cluster ${item.largestClusterSize}`;
+  });
+
+  const overallSingletonRate = input.items.reduce(
+    (sum, item) => sum + (item.clusterCount > 0 ? item.singletonClusters / item.clusterCount : 0), 0
+  ) / Math.max(1, input.items.length);
+
+  const vol = input.volume?.dimensions;
+  const voxelSpacing = input.volume?.voxelSpacing?.x || 10;
+  const volumeNm3 = vol
+    ? ((vol.z * vol.y * vol.x * Math.pow(voxelSpacing, 3)) / 1e9).toFixed(1)
+    : "unknown";
+
   return [
-    "Create a research-style interpretation from the JSON below.",
-    "Focus on how frequency, cluster size, singleton rate, and cluster concentration might relate to biological signal versus annotation noise.",
-    "Generate insight labels that a UI can display as colored cards, with a concise interpretive label and a supporting explanation.",
-    "Use labels like 'High frequency of thyroglobulin', 'Sparse clustering for beta galactosidase', 'Possible enrichment of ribosome signal', or 'Beta amylase excluded from scoring'.",
-    "Avoid labels that are only the molecule name.",
-    "Include molecule-specific insights where appropriate, but also include cross-cutting insights when multiple molecules show a comparable pattern.",
-    "If a specific disease or metabolism hypothesis is not strongly supported, say that it remains speculative rather than forcing a claim.",
-    "Mention the score-exclusion status for beta amylase explicitly.",
-    "Only use the fields in the JSON and do not infer extra measurements.",
-    "If a molecule has no observations, do not fabricate one.",
-    "JSON input:",
-    JSON.stringify(input, null, 2)
-  ].join("\n\n");
+    `Analyze CryoET particle pick data from one tomographic volume.`,
+    `Volume: ${vol ? `${vol.z}×${vol.y}×${vol.x} voxels` : "unknown"} at ${voxelSpacing}Å/voxel ≈ ${volumeNm3} nm³.`,
+    `Total picks: ${input.totalPicks} across ${input.items.length} classes.`,
+    `Overall average singleton rate across all classes: ${(overallSingletonRate * 100).toFixed(1)}%.`,
+    ``,
+    `Per-class breakdown (pre-computed for accuracy):`,
+    ...derived,
+    ``,
+    `Classes fully at 100% singleton rate: ${input.items.filter((i) => i.singletonClusters === i.clusterCount).map((i) => i.label).join(", ") || "none"}.`,
+    `Classes with multi-pick clusters: ${input.items.filter((i) => i.multiPickClusters > 0).map((i) => `${i.label} (${i.multiPickClusters} clusters, largest ${i.largestClusterSize})`).join(", ") || "none"}.`,
+    ``,
+    `Generate a specific, data-driven interpretation. Reference exact numbers. Do not use molecule names as labels.`
+  ].join("\n");
 }
 
 function parseClaudeAnalysisJson(text) {
@@ -621,9 +717,14 @@ function parseClaudeAnalysisJson(text) {
     })).filter((insight) => insight.label || insight.text) : [];
 
     return {
-      title: String(parsed.title || "CryoET Object-Pick Label Summary").trim(),
+      title: String(parsed.title || "CryoSight Analysis").trim(),
       headline: String(parsed.headline || "").trim(),
+      keywords: Array.isArray(parsed.keywords)
+        ? parsed.keywords.map((k) => String(k).trim()).filter(Boolean)
+        : [],
       insights,
+      spatialAnalysis: String(parsed.spatialAnalysis || "").trim(),
+      biologicalContext: String(parsed.biologicalContext || "").trim(),
       datasetSummary: String(parsed.datasetSummary || "").trim(),
       caveats: Array.isArray(parsed.caveats) ? parsed.caveats.map((entry) => String(entry)).filter(Boolean) : [],
       nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps.map((entry) => String(entry)).filter(Boolean) : []
@@ -645,12 +746,21 @@ function structuredAnalysisToMarkdown(structured) {
   if (structured.headline) {
     blocks.push(structured.headline);
   }
+  if (structured.keywords?.length) {
+    blocks.push(`**Tags:** ${structured.keywords.join(" · ")}`);
+  }
   if (structured.datasetSummary) {
-    blocks.push(`### Dataset Summary\n${structured.datasetSummary}`);
+    blocks.push(`### Dataset Composition\n${structured.datasetSummary}`);
   }
   if (structured.insights?.length) {
     const lines = structured.insights.map((insight) => `- [${insight.tone}] ${insight.label}: ${insight.text}`);
-    blocks.push(`### Insight Cards\n${lines.join("\n")}`);
+    blocks.push(`### Insights\n${lines.join("\n")}`);
+  }
+  if (structured.spatialAnalysis) {
+    blocks.push(`### Spatial Distribution\n${structured.spatialAnalysis}`);
+  }
+  if (structured.biologicalContext) {
+    blocks.push(`### Biological Context\n${structured.biologicalContext}`);
   }
   if (structured.caveats?.length) {
     blocks.push(`### Caveats\n${structured.caveats.map((item) => `- ${item}`).join("\n")}`);
@@ -661,7 +771,7 @@ function structuredAnalysisToMarkdown(structured) {
   return blocks.join("\n\n");
 }
 
-async function generateClaudeAnalysis(aggregation) {
+async function generateClaudeAnalysis(aggregation, timeoutMs = 45000) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     const structured = buildStructuredFallbackAnalysis(aggregation);
@@ -676,7 +786,7 @@ async function generateClaudeAnalysis(aggregation) {
 
   // AbortController with 15s timeout to prevent hanging
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   let response;
   try {
@@ -690,7 +800,7 @@ async function generateClaudeAnalysis(aggregation) {
       },
       body: JSON.stringify({
         model,
-        max_tokens: 900,
+        max_tokens: 4096,
         temperature: 0.2,
         system: buildClaudeSystemPrompt(),
         messages: [
@@ -712,8 +822,8 @@ async function generateClaudeAnalysis(aggregation) {
     return {
       structured,
       report: structuredAnalysisToMarkdown(structured),
-      reportStatus: "API error",
-      reportError: fetchErr.name === "AbortError" ? "Claude API request timed out" : fetchErr.message
+      reportStatus: "Ready",
+      reportWarning: fetchErr.name === "AbortError" ? "Claude API request timed out; using local analysis." : `Claude API unavailable; using local analysis. ${fetchErr.message}`
     };
   }
   clearTimeout(timeoutId);
@@ -732,15 +842,25 @@ async function generateClaudeAnalysis(aggregation) {
     const structured = buildStructuredFallbackAnalysis(aggregation);
     return {
       structured,
-      report: `${structuredAnalysisToMarkdown(structured)}\n\n### Claude Error\n${message}`,
-      reportStatus: "API error",
-      reportError: message,
-      reportErrorBody: body,
+      report: structuredAnalysisToMarkdown(structured),
+      reportStatus: "Ready",
+      reportWarning: `Claude API returned HTTP ${response.status}; using local analysis.`,
       reportErrorStatus: response.status
     };
   }
 
-  const payload = await response.json();
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    const structured = buildStructuredFallbackAnalysis(aggregation);
+    return {
+      structured,
+      report: structuredAnalysisToMarkdown(structured),
+      reportStatus: "Ready",
+      reportWarning: "Claude API returned invalid JSON; using local analysis."
+    };
+  }
   const structured = parseClaudeAnalysisJson(extractClaudeText(payload)) || buildStructuredFallbackAnalysis(aggregation);
   return {
     structured,
@@ -1485,6 +1605,7 @@ async function handleApi(req, res) {
     const pickDetections = await loadPickDetections(zarrPath, levelZeroShape);
     const spacing = await readLevelZeroSpacing(zarrPath);
     const aggregation = buildMoleculeAggregation(pickDetections, 0, buildVolumeMetadata(levelZeroShape, spacing));
+    latestAggregation.set(zarrPath, aggregation);
 
     sendJson(res, 200, {
       level: resolvedLevel,
@@ -1493,7 +1614,12 @@ async function handleApi(req, res) {
       shape,
       stats: { min: 0, max: 0, points: 0, stride },
       points: [],
-      detections: pickDetections
+      detections: pickDetections,
+      analysis: {
+        aggregation,
+        structured: buildStructuredFallbackAnalysis(aggregation),
+        reportStatus: pickDetections.length > 0 ? "Generating..." : "Waiting for labels"
+      }
     });
     return;
   }
@@ -1628,14 +1754,15 @@ async function handleApi(req, res) {
 
     const detections = await buildPickDetectionsFromFiles(zarrPath, levelZeroShape, jsonFiles, "uploaded labels");
     const aggregation = buildMoleculeAggregation(detections, jsonFiles.length, volume);
-    const aiAnalysis = await generateClaudeAnalysis(aggregation);
+    latestAggregation.set(zarrPath, aggregation);
     sendJson(res, 200, {
       files: upload.files,
       jsonFiles: jsonFiles.length,
       detections,
       analysis: {
         aggregation,
-        ...aiAnalysis
+        structured: buildStructuredFallbackAnalysis(aggregation),
+        reportStatus: "Generating..."
       }
     });
     return;
@@ -1807,6 +1934,25 @@ async function handleApi(req, res) {
     runInferenceProcess(resolvedPath, scanId, emitter).catch((err) => {
       emitter.emit("error", { message: err.message || String(err) });
     });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/analysis") {
+    const body = await readRequestJson(req);
+    const resolvedPath = resolveScanPath(body.zarrPath);
+    if (!resolvedPath) {
+      sendJson(res, 400, { error: "Invalid or unknown scan path" });
+      return;
+    }
+
+    const aggregation = latestAggregation.get(resolvedPath);
+    if (!aggregation) {
+      sendJson(res, 404, { error: "No scan data cached for this path. Load the scan first." });
+      return;
+    }
+
+    const aiAnalysis = await generateClaudeAnalysis(aggregation, 45000);
+    sendJson(res, 200, { ...aiAnalysis, aggregation });
     return;
   }
 
@@ -2006,7 +2152,8 @@ async function runInferenceProcess(zarrPath, scanId, emitter) {
       let aiAnalysis = null;
       try {
         const aggregation = buildMoleculeAggregation(detections, pickFiles.length, buildVolumeMetadata(levelZeroShape, spacing));
-        aiAnalysis = await generateClaudeAnalysis(aggregation);
+        latestAggregation.set(zarrPath, aggregation);
+        aiAnalysis = { structured: buildStructuredFallbackAnalysis(aggregation), reportStatus: "Generating..." };
       } catch {
         // Analysis is best-effort
       }
