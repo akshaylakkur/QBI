@@ -4,12 +4,14 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
+const { EventEmitter } = require("node:events");
 
 const port = Number.parseInt(process.env.PORT || "3000", 10);
 const publicDir = __dirname;
 const sampleDir = path.join(__dirname, "sample_data");
 const uploadsDir = path.join(__dirname, "uploaded_scans");
 const labelUploadsDir = path.join(__dirname, "uploaded_labels");
+const predictionsDir = path.join(__dirname, "predictions");
 const slicerExportDir = path.join(os.tmpdir(), "qbi-slicer-exports");
 const volumeCache = new Map();
 const volumeLoadCache = new Map();
@@ -19,6 +21,9 @@ let sliceCacheBytes = 0;
 const maxSliceCacheBytes = 96 * 1024 * 1024;
 const localScans = new Map();
 const pickCache = new Map();
+
+// Inference progress tracking (SSE)
+const inferenceEmitters = new Map();
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -668,31 +673,50 @@ async function generateClaudeAnalysis(aggregation) {
   }
 
   const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 900,
-      temperature: 0.2,
-      system: buildClaudeSystemPrompt(),
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: buildClaudeUserPrompt(aggregation)
-            }
-          ]
-        }
-      ]
-    })
-  });
+
+  // AbortController with 15s timeout to prevent hanging
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+  let response;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 900,
+        temperature: 0.2,
+        system: buildClaudeSystemPrompt(),
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: buildClaudeUserPrompt(aggregation)
+              }
+            ]
+          }
+        ]
+      })
+    });
+  } catch (fetchErr) {
+    clearTimeout(timeoutId);
+    const structured = buildStructuredFallbackAnalysis(aggregation);
+    return {
+      structured,
+      report: structuredAnalysisToMarkdown(structured),
+      reportStatus: "API error",
+      reportError: fetchErr.name === "AbortError" ? "Claude API request timed out" : fetchErr.message
+    };
+  }
+  clearTimeout(timeoutId);
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
@@ -1686,7 +1710,370 @@ async function handleApi(req, res) {
     return;
   }
 
+  // ─── Inference endpoints ──────────────────────────────────────────────
+
+  if (req.method === "GET" && url.pathname === "/api/inference/progress") {
+    const scanId = url.searchParams.get("scanId");
+    if (!scanId) {
+      sendJson(res, 400, { error: "scanId required" });
+      return;
+    }
+
+    // SSE: Server-Sent Events for progress streaming
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*"
+    });
+
+    const emitter = inferenceEmitters.get(scanId) || new EventEmitter();
+    inferenceEmitters.set(scanId, emitter);
+
+    const onProgress = (data) => {
+      res.write(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    const onComplete = (data) => {
+      res.write(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
+      res.end();
+      cleanup();
+      clearInterval(keepAlive);
+    };
+    const onError = (err) => {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
+      res.end();
+      cleanup();
+      clearInterval(keepAlive);
+    };
+
+    const cleanup = () => {
+      emitter.removeListener("progress", onProgress);
+      emitter.removeListener("complete", onComplete);
+      emitter.removeListener("error", onError);
+      inferenceEmitters.delete(scanId);
+    };
+
+    emitter.on("progress", onProgress);
+    emitter.on("complete", onComplete);
+    emitter.on("error", onError);
+
+    // Keep-alive
+    const keepAlive = setInterval(() => {
+      res.write(": keepalive\n\n");
+    }, 15000);
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      cleanup();
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/inference/run") {
+    const body = await readRequestJson(req);
+    const zarrPath = body.zarrPath;
+    const scanId = body.scanId || `infer-${Date.now()}`;
+
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "zarrPath is required" });
+      return;
+    }
+
+    // Resolve the actual filesystem path
+    let resolvedPath = null;
+    if (zarrPath.startsWith("local:")) {
+      resolvedPath = localScans.get(zarrPath);
+    } else {
+      resolvedPath = resolveScanPath(zarrPath);
+    }
+    if (!resolvedPath) {
+      // Try as a direct path
+      resolvedPath = path.resolve(zarrPath);
+      if (!fs.existsSync(resolvedPath)) {
+        sendJson(res, 400, { error: `Zarr path not found: ${zarrPath}` });
+        return;
+      }
+    }
+
+    // Create emitter if not already present
+    if (!inferenceEmitters.has(scanId)) {
+      inferenceEmitters.set(scanId, new EventEmitter());
+    }
+    const emitter = inferenceEmitters.get(scanId);
+
+    // Respond immediately that inference has started
+    sendJson(res, 200, { scanId, status: "started", message: "Inference started" });
+
+    // Run inference asynchronously
+    runInferenceProcess(resolvedPath, scanId, emitter).catch((err) => {
+      emitter.emit("error", { message: err.message || String(err) });
+    });
+    return;
+  }
+
   sendJson(res, 404, { error: "API route not found" });
+}
+
+// ─── Inference runner ──────────────────────────────────────────────────
+
+const projectRoot = path.resolve(__dirname, "..");
+const inferenceScript = path.join(projectRoot, "backend", "inference", "run_inference_direct.py");
+const hardcodedCheckpoint = path.resolve(os.homedir(), "Downloads", "czii-weights", "weight_best.ckpt");
+
+async function runInferenceProcess(zarrPath, scanId, emitter) {
+  const checkpoint = hardcodedCheckpoint;
+  if (!fs.existsSync(checkpoint)) {
+    emitter.emit("error", { message: `Checkpoint not found at ${checkpoint}. Please ensure the file exists.` });
+    return;
+  }
+
+  await fsp.mkdir(predictionsDir, { recursive: true });
+  const outputPath = path.join(predictionsDir, `predictions_${scanId}.json`);
+
+  // Determine device
+  let device = "cpu";
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    device = "mps";
+  } else if (process.platform !== "darwin") {
+    device = "cuda";
+  }
+
+  const env = {
+    ...process.env,
+    PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0",
+    PYTHONUNBUFFERED: "1"
+  };
+
+  const args = [
+    inferenceScript,
+    "--checkpoint", checkpoint,
+    "--zarr_path", zarrPath,
+    "--device", device,
+    "--dtype", "float32",
+    "--window_size", "64", "64", "64",
+    "--tiles_per_dim", "3", "10", "10",
+    "--output", outputPath,
+    "--iou_threshold", "0.85"
+  ];
+
+  emitter.emit("progress", { phase: "loading", percent: 0, message: "Starting inference..." });
+
+  const child = spawn("python3", args, {
+    cwd: projectRoot,
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  const stderrChunks = [];
+
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString("utf8");
+    stderrChunks.push(text);
+
+    // Parse progress lines — format: __QBI_PROGRESS__:<percent>:<batch>/<total>:<bar>
+    const progressMatch = text.match(/__QBI_PROGRESS__:([0-9.]+)(?::(\d+)\/(\d+):([█░]+))?/);
+    if (progressMatch) {
+      const percent = Number.parseFloat(progressMatch[1]);
+      const phase = percent < 0.1 ? "loading" : percent < 0.85 ? "inference" : "decoding";
+      const messages = {
+        loading: "Loading model and volume...",
+        inference: "Running model inference on tiles...",
+        decoding: "Decoding detections..."
+      };
+
+      const progressData = {
+        phase,
+        percent: Math.round(percent * 100),
+        message: messages[phase] || "Processing..."
+      };
+
+      // Add tqdm-style bar info if available
+      if (progressMatch[2] && progressMatch[3]) {
+        const batch = Number.parseInt(progressMatch[2], 10);
+        const total = Number.parseInt(progressMatch[3], 10);
+        const bar = progressMatch[4] || "";
+        progressData.batch = batch;
+        progressData.total = total;
+        progressData.bar = bar;
+        progressData.message = `Tile ${batch} / ${total}  ${bar}`;
+      }
+
+      emitter.emit("progress", progressData);
+    }
+
+    // Also emit log lines for the UI
+    const logMatch = text.match(/^(Loading|Running|Found|Saved|Volume|Output)/m);
+    if (logMatch) {
+      emitter.emit("progress", {
+        phase: "inference",
+        percent: -1,
+        message: text.trim()
+      });
+    }
+  });
+
+  child.on("error", (err) => {
+    emitter.emit("error", { message: `Failed to start inference: ${err.message}` });
+  });
+
+  child.on("close", async (code) => {
+    if (code !== 0) {
+      const stderr = stderrChunks.join("");
+      const errorMsg = stderr.split("\n").filter((l) => l && !l.startsWith("__QBI_")).slice(-5).join("; ");
+      emitter.emit("error", { message: `Inference failed (exit ${code}): ${errorMsg || "Unknown error"}` });
+      return;
+    }
+
+    // Read the predictions file
+    try {
+      const predictionsRaw = await fsp.readFile(outputPath, "utf8");
+      const predictions = JSON.parse(predictionsRaw);
+
+      // Convert predictions to pick-style detections
+      const levelShapes = await readZarrLevelShapes(zarrPath);
+      let levelZeroShape = levelShapes["0"] || Object.values(levelShapes)[0];
+      if (!levelZeroShape) {
+        // Fallback: use a default shape based on the predictions
+        const maxVoxel = { x: 0, y: 0, z: 0 };
+        for (const det of (predictions.detections || [])) {
+          maxVoxel.x = Math.max(maxVoxel.x, Math.ceil(det.x_pixel || 0));
+          maxVoxel.y = Math.max(maxVoxel.y, Math.ceil(det.y_pixel || 0));
+          maxVoxel.z = Math.max(maxVoxel.z, Math.ceil(det.z_pixel || 0));
+        }
+        levelZeroShape = { x: Math.max(1, maxVoxel.x + 100), y: Math.max(1, maxVoxel.y + 100), z: Math.max(1, maxVoxel.z + 100) };
+      }
+      const spacing = await readLevelZeroSpacing(zarrPath).catch(() => ({ x: 10, y: 10, z: 10 }));
+
+      // Build pick files from predictions
+      const pickFiles = await buildPickFilesFromPredictions(predictions, zarrPath, levelZeroShape, spacing, scanId);
+
+      // Load the detections into the format the frontend expects
+      const detections = [];
+      for (const [fileIndex, pickFile] of pickFiles.entries()) {
+        const payload = await readJson(pickFile.path);
+        const points = Array.isArray(payload?.points) ? payload.points : [];
+        const type = payload?.pickable_object_name || path.basename(pickFile.path, ".json");
+        const label = formatMoleculeName(type);
+        const color = pickColor(type, fileIndex);
+        const radiusAngstrom = pickRadiusAngstrom(type);
+        const radiusVoxel = radiusAngstrom / ((spacing.x + spacing.y + spacing.z) / 3);
+
+        points.forEach((point, pointIndex) => {
+          const location = point.location || {};
+          const voxel = {
+            x: Number(location.x) / spacing.x,
+            y: Number(location.y) / spacing.y,
+            z: Number(location.z) / spacing.z
+          };
+
+          if (!Number.isFinite(voxel.x) || !Number.isFinite(voxel.y) || !Number.isFinite(voxel.z)) {
+            return;
+          }
+
+          const clipped = {
+            x: Math.max(0, Math.min(levelZeroShape.x - 1, voxel.x)),
+            y: Math.max(0, Math.min(levelZeroShape.y - 1, voxel.y)),
+            z: Math.max(0, Math.min(levelZeroShape.z - 1, voxel.z))
+          };
+
+          detections.push({
+            id: `${type}-${String(pointIndex + 1).padStart(3, "0")}`,
+            type: label,
+            molecule: type,
+            confidence: `model: ${(point.score || 1.0).toFixed(3)}`,
+            volume: path.basename(zarrPath),
+            color,
+            radiusAngstrom,
+            radiusVoxel,
+            coords: [
+              (clipped.x / Math.max(1, levelZeroShape.x - 1)) - 0.5,
+              (clipped.y / Math.max(1, levelZeroShape.y - 1)) - 0.5,
+              (clipped.z / Math.max(1, levelZeroShape.z - 1)) - 0.5
+            ],
+            voxel: { x: clipped.x, y: clipped.y, z: clipped.z },
+            physical: {
+              x: Number(location.x),
+              y: Number(location.y),
+              z: Number(location.z),
+              unit: "angstrom"
+            },
+            position: `X ${Math.round(clipped.x)}, Y ${Math.round(clipped.y)}, Z ${Math.round(clipped.z)}`,
+            notes: `${label} model detection. Confidence ${(point.score || 1.0).toFixed(3)}.`
+          });
+        });
+      }
+
+      // Build analysis inline (with 15s timeout on Claude API)
+      let aiAnalysis = null;
+      try {
+        const aggregation = buildMoleculeAggregation(detections, pickFiles.length, buildVolumeMetadata(levelZeroShape, spacing));
+        aiAnalysis = await generateClaudeAnalysis(aggregation);
+      } catch {
+        // Analysis is best-effort
+      }
+
+      emitter.emit("complete", {
+        detections,
+        analysis: aiAnalysis,
+        predictionsFile: path.relative(__dirname, outputPath),
+        pickFiles: pickFiles.map((f) => path.relative(__dirname, f.path)),
+        numDetections: detections.length
+      });
+    } catch (err) {
+      emitter.emit("error", { message: `Failed to process predictions: ${err.message}` });
+    }
+  });
+}
+
+async function buildPickFilesFromPredictions(predictions, zarrPath, levelZeroShape, spacing, scanId) {
+  const detections = predictions.detections || [];
+  const studyName = path.basename(zarrPath).replace(/\.zarr$/i, "");
+
+  // Group by particle type
+  const groups = {};
+  for (const det of detections) {
+    const type = det.particle_type || "unknown";
+    if (!groups[type]) groups[type] = [];
+    groups[type].push(det);
+  }
+
+  const pickDir = path.join(predictionsDir, `picks_${scanId}`);
+  await fsp.mkdir(pickDir, { recursive: true });
+  const writtenFiles = [];
+
+  for (const [moleculeName, moleculeDets] of Object.entries(groups)) {
+    const points = moleculeDets.map((det) => ({
+      location: {
+        x: det.x_angstrom,
+        y: det.y_angstrom,
+        z: det.z_angstrom
+      },
+      transformation_: [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      instance_id: 0,
+      score: det.score || 1.0
+    }));
+
+    const pickPayload = {
+      pickable_object_name: moleculeName,
+      user_id: "model",
+      session_id: "0",
+      run_name: studyName,
+      voxel_spacing: null,
+      unit: "angstrom",
+      points,
+      trust_orientation: true
+    };
+
+    const outputPath = path.join(pickDir, `${moleculeName}.json`);
+    await fsp.writeFile(outputPath, JSON.stringify(pickPayload, null, 2));
+    writtenFiles.push({ path: outputPath, molecule: moleculeName });
+  }
+
+  return writtenFiles;
 }
 
 const server = http.createServer((req, res) => {

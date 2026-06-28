@@ -55,6 +55,19 @@
               <option value="0">Level 0 - full resolution</option>
             </select>
           </div>
+
+          <div class="inference-section">
+            <button id="run-inference" type="button" class="inference-button">
+              <span class="inference-icon">▶</span>
+              Run Model Inference
+            </button>
+            <div id="inference-progress" class="inference-progress" hidden>
+              <div class="inference-progress-bar">
+                <span id="inference-progress-fill" class="inference-progress-fill"></span>
+              </div>
+              <span id="inference-status" class="inference-status-text">Starting...</span>
+            </div>
+          </div>
         </section>
 
         <section class="panel">

@@ -109,7 +109,11 @@ const elements = {
     x: document.querySelector("#x-slice-value")?.closest(".slice-slider-control"),
     y: document.querySelector("#y-slice-value")?.closest(".slice-slider-control"),
     z: document.querySelector("#z-slice-value")?.closest(".slice-slider-control")
-  }
+  },
+  runInference: document.querySelector("#run-inference"),
+  inferenceProgress: document.querySelector("#inference-progress"),
+  inferenceProgressFill: document.querySelector("#inference-progress-fill"),
+  inferenceStatus: document.querySelector("#inference-status")
 };
 
 const scene = new THREE.Scene();
@@ -1583,6 +1587,160 @@ async function openSelectedScanInSlicer() {
   }
 }
 
+// ─── Inference (model prediction) ──────────────────────────────────────
+
+let inferenceScanId = null;
+
+async function runInference() {
+  if (!state.selectedScan) {
+    showError(new Error("Select a scan first before running inference."));
+    return;
+  }
+
+  // Disable button and show progress
+  elements.runInference.disabled = true;
+  elements.runInference.classList.add("is-running");
+  elements.runInference.innerHTML = '<span class="inference-icon">⏳</span> Running...';
+  elements.inferenceProgress.hidden = false;
+  elements.inferenceProgressFill.style.width = "0%";
+  elements.inferenceStatus.textContent = "Starting inference...";
+
+  inferenceScanId = `infer-${Date.now()}`;
+
+  try {
+    // Start the inference via API
+    const response = await fetch("/api/inference/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        zarrPath: state.selectedScan,
+        scanId: inferenceScanId
+      })
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || "Failed to start inference");
+    }
+
+    // Connect to SSE for progress
+    const eventSource = new EventSource(`/api/inference/progress?scanId=${inferenceScanId}`);
+
+    eventSource.addEventListener("progress", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.percent >= 0) {
+          elements.inferenceProgressFill.style.width = `${data.percent}%`;
+        }
+        if (data.message) {
+          elements.inferenceStatus.textContent = data.message;
+        }
+        // Render tqdm-style bar if available
+        if (data.bar) {
+          elements.inferenceStatus.innerHTML = `Tile ${data.batch} / ${data.total} <span class="tqdm-bar">${data.bar}</span>`;
+        }
+      } catch (e) {
+        // Ignore parse errors
+      }
+    });
+
+    eventSource.addEventListener("complete", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        onInferenceComplete(data);
+      } catch (e) {
+        showError(new Error("Failed to parse inference results"));
+        resetInferenceButton();
+      }
+      eventSource.close();
+    });
+
+    eventSource.addEventListener("analysis", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.analysis) {
+          renderAnalysis(data.analysis);
+        }
+      } catch (e) {
+        // Analysis is best-effort
+      }
+    });
+
+    eventSource.addEventListener("error", (event) => {
+      let errorMsg = "Inference failed";
+      try {
+        const data = JSON.parse(event.data);
+        errorMsg = data.error || errorMsg;
+      } catch (e) {
+        // Use default error message
+      }
+      showError(new Error(errorMsg));
+      resetInferenceButton();
+      eventSource.close();
+    });
+
+    // Fallback timeout (30 minutes)
+    setTimeout(() => {
+      if (eventSource.readyState !== EventSource.CLOSED) {
+        eventSource.close();
+        showError(new Error("Inference timed out after 30 minutes"));
+        resetInferenceButton();
+      }
+    }, 30 * 60 * 1000);
+
+  } catch (err) {
+    showError(err);
+    resetInferenceButton();
+  }
+}
+
+function onInferenceComplete(data) {
+  if (data.detections) {
+    // Update state with new detections
+    state.detections = data.detections;
+    state.selectedDetection = null;
+    state.selectedMolecule = null;
+    state.expandedMolecules.clear();
+
+    const initialGroups = getMoleculeGroups();
+    if (initialGroups.length > 0) {
+      state.expandedMolecules.add(initialGroups[0].molecule);
+    }
+
+    // Refresh the viewer
+    sliceCache.clear();
+    if (state.vivActive) {
+      updateVivLayers();
+    } else {
+      renderVolumeScene(state.volume);
+    }
+    renderDetectionList();
+    renderAnalysis(data.analysis || {});
+    if (state.volume) {
+      Promise.all(sliceAxes.map((axis) => loadSlice(axis))).then(() => {
+        startSlicePrecache("Caching inference overlays");
+      });
+    }
+
+    elements.detectionCount.textContent = `${initialGroups.length} type${initialGroups.length !== 1 ? "s" : ""} · ${state.detections.length} picks`;
+    elements.inferenceStatus.textContent = `✓ ${data.numDetections} particles detected`;
+    elements.inferenceProgressFill.style.width = "100%";
+    elements.inferenceProgressFill.style.background = "#16743a";
+  }
+
+  resetInferenceButton();
+}
+
+function resetInferenceButton() {
+  elements.runInference.disabled = false;
+  elements.runInference.classList.remove("is-running");
+  elements.runInference.innerHTML = '<span class="inference-icon">▶</span> Run Model Inference';
+  // Keep progress visible for a bit, then hide
+  setTimeout(() => {
+    elements.inferenceProgress.hidden = true;
+    elements.inferenceProgressFill.style.background = "";
+  }, 5000);
+}
+
 function animate() {
   requestAnimationFrame(animate);
   if (state.autoRotate) {
@@ -1626,6 +1784,7 @@ elements.rotateToggle.addEventListener("click", () => {
 elements.openSlicer.addEventListener("click", () => openSelectedScanInSlicer().catch(showError));
 elements.reloadScan.addEventListener("click", () => loadPreview().catch(showError));
 elements.showAllBtn.addEventListener("click", clearMoleculeSelection);
+elements.runInference.addEventListener("click", () => runInference().catch(showError));
 sliceAxes.forEach((axis) => {
   elements.sliceSliders[axis].addEventListener("input", () => {
     if (!state.volume) {

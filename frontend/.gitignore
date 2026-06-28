@@ -21,6 +21,7 @@ Thumbs.db
 # Runtime/generated data
 uploaded_scans/
 uploaded_labels/
+predictions/
 sample_data/
 *.log
 *.tmp
