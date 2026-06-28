@@ -1865,21 +1865,37 @@ async function handleApi(req, res) {
       "Access-Control-Allow-Origin": "*"
     });
 
+    // Handle client disconnect to prevent EPIPE errors
+    let resClosed = false;
+    const safeWrite = (data) => {
+      if (!resClosed) {
+        try { res.write(data); } catch { /* ignore EPIPE */ }
+      }
+    };
+    const safeEnd = () => {
+      if (!resClosed) {
+        resClosed = true;
+        try { res.end(); } catch { /* ignore EPIPE */ }
+      }
+    };
+    res.on("error", () => { resClosed = true; });
+    res.on("close", () => { resClosed = true; });
+
     const emitter = inferenceEmitters.get(scanId) || new EventEmitter();
     inferenceEmitters.set(scanId, emitter);
 
     const onProgress = (data) => {
-      res.write(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
+      safeWrite(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
     };
     const onComplete = (data) => {
-      res.write(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
-      res.end();
+      safeWrite(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
+      safeEnd();
       cleanup();
       clearInterval(keepAlive);
     };
     const onError = (err) => {
-      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
-      res.end();
+      safeWrite(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
+      safeEnd();
       cleanup();
       clearInterval(keepAlive);
     };
@@ -1897,11 +1913,12 @@ async function handleApi(req, res) {
 
     // Keep-alive
     const keepAlive = setInterval(() => {
-      res.write(": keepalive\n\n");
+      safeWrite(": keepalive\n\n");
     }, 15000);
     req.on("close", () => {
       clearInterval(keepAlive);
       cleanup();
+      safeEnd();
     });
     return;
   }
@@ -1967,21 +1984,37 @@ async function handleApi(req, res) {
       "Access-Control-Allow-Origin": "*"
     });
 
+    // Handle client disconnect to prevent EPIPE errors
+    let resClosed = false;
+    const safeWrite = (data) => {
+      if (!resClosed) {
+        try { res.write(data); } catch { /* ignore EPIPE */ }
+      }
+    };
+    const safeEnd = () => {
+      if (!resClosed) {
+        resClosed = true;
+        try { res.end(); } catch { /* ignore EPIPE */ }
+      }
+    };
+    res.on("error", () => { resClosed = true; });
+    res.on("close", () => { resClosed = true; });
+
     const emitter = crowdingEmitters.get(jobId) || new EventEmitter();
     crowdingEmitters.set(jobId, emitter);
 
     const onProgress = (data) => {
-      res.write(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
+      safeWrite(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
     };
     const onComplete = (data) => {
-      res.write(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
-      res.end();
+      safeWrite(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
+      safeEnd();
       cleanup();
       clearInterval(keepAlive);
     };
     const onError = (err) => {
-      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
-      res.end();
+      safeWrite(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
+      safeEnd();
       cleanup();
       clearInterval(keepAlive);
     };
@@ -1998,11 +2031,12 @@ async function handleApi(req, res) {
     emitter.on("error", onError);
 
     const keepAlive = setInterval(() => {
-      res.write(": keepalive\n\n");
+      safeWrite(": keepalive\n\n");
     }, 15000);
     req.on("close", () => {
       clearInterval(keepAlive);
       cleanup();
+      safeEnd();
     });
     return;
   }
@@ -2543,6 +2577,21 @@ const server = http.createServer((req, res) => {
         res.end(data);
       }
     });
+  });
+});
+
+// Global error handler to prevent unhandled EPIPE crashes
+server.on("clientError", (err, socket) => {
+  if (err.code === "EPIPE" || err.code === "ECONNRESET") {
+    socket.destroy();
+  }
+});
+
+server.on("connection", (socket) => {
+  socket.on("error", (err) => {
+    if (err.code === "EPIPE" || err.code === "ECONNRESET") {
+      // Client disconnected — this is expected, not a crash
+    }
   });
 });
 

@@ -15,9 +15,6 @@ import numpy as np
 
 from downstream.constants import RADIUS_ANGSTROM
 from downstream.geometry.exposure import steric_exposure_batch, steric_exposure_one
-from downstream.gnn.features import EDGE_DIM, FeatureStats, build_edges
-from downstream.gnn.graph import build_graph_from_arrays
-from downstream.gnn.model import ExposureGNN
 from downstream.qa.grid_viability import GridViabilityConfig, assess_cloud
 from downstream.types import ExposureConfig, ParticleCloud
 
@@ -128,6 +125,8 @@ def _knn_neighbor_ids(
     n = len(coords)
     pick_ids: List[str] = list(getattr(cloud, "pick_ids", [str(i) for i in range(n)]))
 
+    from downstream.gnn.features import build_edges
+
     edge_index, _edge_attr = build_edges(coords, radii, edge_cutoff=edge_cutoff, knn_k=knn_k)
 
     neighbors: Dict[int, List[tuple[int, float]]] = {i: [] for i in range(n)}
@@ -187,36 +186,42 @@ def run_crowding(
     gnn_exposure = exposure.copy()
     ckpt_path = Path(checkpoint_path)
     if ckpt_path.exists():
-        import torch
+        try:
+            from downstream.gnn.features import EDGE_DIM, FeatureStats, build_edges
+            from downstream.gnn.graph import build_graph_from_arrays
+            from downstream.gnn.model import ExposureGNN
+            import torch
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        cfg = ckpt.get("config", {})
-        stats = FeatureStats.from_dict(ckpt["feature_stats"])
-        model = ExposureGNN(
-            in_channels=ckpt["in_channels"],
-            hidden_dim=cfg.get("hidden_dim", 64),
-            out_channels=cfg.get("out_channels", 32),
-            dropout=cfg.get("dropout", 0.25),
-            heads=cfg.get("heads", 2),
-            edge_dim=ckpt.get("edge_dim", EDGE_DIM),
-        )
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            cfg = ckpt.get("config", {})
+            stats = FeatureStats.from_dict(ckpt["feature_stats"])
+            model = ExposureGNN(
+                in_channels=ckpt["in_channels"],
+                hidden_dim=cfg.get("hidden_dim", 64),
+                out_channels=cfg.get("out_channels", 32),
+                dropout=cfg.get("dropout", 0.25),
+                heads=cfg.get("heads", 2),
+                edge_dim=ckpt.get("edge_dim", EDGE_DIM),
+            )
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
 
-        edge_cutoff = cfg.get("edge_cutoff", 500.0)
-        knn_k = cfg.get("knn_k", 12)
-        graph = build_graph_from_arrays(
-            cloud.tomo_id,
-            cloud.types,
-            cloud.coords,
-            cloud.radii,
-            exposure,
-            edge_cutoff=edge_cutoff,
-            knn_k=knn_k,
-            feature_stats=stats,
-        )
-        with torch.no_grad():
-            gnn_exposure = model(graph.x, graph.edge_index, graph.edge_attr).numpy().ravel()
+            edge_cutoff = cfg.get("edge_cutoff", 500.0)
+            knn_k = cfg.get("knn_k", 12)
+            graph = build_graph_from_arrays(
+                cloud.tomo_id,
+                cloud.types,
+                cloud.coords,
+                cloud.radii,
+                exposure,
+                edge_cutoff=edge_cutoff,
+                knn_k=knn_k,
+                feature_stats=stats,
+            )
+            with torch.no_grad():
+                gnn_exposure = model(graph.x, graph.edge_index, graph.edge_attr).numpy().ravel()
+        except ImportError as e:
+            _emit_progress(0.45, f"GNN dependencies not available ({e}); using geometry only")
     else:
         _emit_progress(0.45, f"GNN checkpoint not found at {ckpt_path}; using geometry only")
 
