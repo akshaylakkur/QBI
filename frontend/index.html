@@ -3,18 +3,40 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>QBI CryoET Review</title>
+    <title>CryoSight</title>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
     <header class="app-header">
       <div>
-        <p class="eyebrow">QBI Web Platform</p>
-        <h1>CryoET Scan Review</h1>
-      </div>
-      <div class="header-actions" aria-label="Project actions">
-        <button id="reset-camera" class="icon-button" type="button" aria-label="Reset 3D view">0</button>
-        <button class="primary-action" type="button">Export Report</button>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 196 40" fill="none" role="img" aria-label="CryoSight" class="app-logo">
+          <defs>
+            <linearGradient id="csg" x1="0" y1="0" x2="1" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stop-color="#14d0d0"/>
+              <stop offset="100%" stop-color="#0b8a8b"/>
+            </linearGradient>
+            <filter id="csglow" x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur in="SourceGraphic" stdDeviation="1" result="b"/>
+              <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+          <path d="M2,20 Q22,4 42,20 Q22,36 2,20 Z"
+                stroke="url(#csg)" stroke-width="1.5" fill="rgba(14,165,166,0.07)" filter="url(#csglow)"/>
+          <circle cx="22" cy="20" r="8.5" stroke="url(#csg)" stroke-width="1.4" fill="none" filter="url(#csglow)"/>
+          <g transform="translate(22,20)" stroke="#0ea5a6" stroke-width="1.1" stroke-linecap="round" opacity="0.82">
+            <line x1="0" y1="-8.5" x2="0" y2="-12"/>
+            <line x1="0" y1="8.5" x2="0" y2="12"/>
+            <line x1="7.36" y1="-4.25" x2="10.39" y2="-6"/>
+            <line x1="-7.36" y1="-4.25" x2="-10.39" y2="-6"/>
+            <line x1="7.36" y1="4.25" x2="10.39" y2="6"/>
+            <line x1="-7.36" y1="4.25" x2="-10.39" y2="6"/>
+          </g>
+          <circle cx="22" cy="20" r="4" fill="#0ea5a6" filter="url(#csglow)"/>
+          <circle cx="22" cy="20" r="1.8" fill="#7df4f4"/>
+          <text y="28" font-size="20" letter-spacing="-0.5">
+            <tspan x="50" font-weight="700" fill="#0ea5a6">Cryo</tspan><tspan font-weight="300" fill="#64748b">Sight</tspan>
+          </text>
+        </svg>
       </div>
     </header>
 
@@ -108,7 +130,7 @@
           <div class="viewer-toolbar">
             <div>
               <p class="eyebrow">Interactive volume</p>
-              <h2 id="viewer-title">3D Zarr Preview</h2>
+              <h2 id="viewer-title">3D Cryo View</h2>
             </div>
             <div class="slice-toolbar" aria-label="Orthogonal slice controls">
               <div class="slice-preview-strip" aria-label="Slice previews">
