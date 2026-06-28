@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QBI · CryoET Scan Review · Hackathon Presentation</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      overflow: hidden;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    /* ── Slide container ── */
+    .slides {
+      display: flex;
+      transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+      height: 100vh;
+      width: 100vw;
+    }
+
+    .slide {
+      min-width: 100vw;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 5vh 8vw;
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* ── Background gradients ── */
+    .slide-bg-teal {
+      background: radial-gradient(ellipse at 20% 50%, #0b7f8320 0%, transparent 60%),
+                  radial-gradient(ellipse at 80% 20%, #075a5f10 0%, transparent 50%),
+                  #0d1117;
+    }
+    .slide-bg-blue {
+      background: radial-gradient(ellipse at 80% 60%, #315f9d20 0%, transparent 60%),
+                  radial-gradient(ellipse at 20% 20%, #0b7f8310 0%, transparent 50%),
+                  #0d1117;
+    }
+    .slide-bg-amber {
+      background: radial-gradient(ellipse at 30% 80%, #b96d1220 0%, transparent 60%),
+                  radial-gradient(ellipse at 70% 30%, #0b7f8310 0%, transparent 50%),
+                  #0d1117;
+    }
+    .slide-bg-dark {
+      background: radial-gradient(ellipse at 50% 30%, #0b7f8315 0%, transparent 50%),
+                  #0d1117;
+    }
+    .slide-bg-white {
+      background: #f6f8f8;
+      color: #172026;
+    }
+
+    /* ── Typography ── */
+    .eyebrow {
+      font-size: 0.75rem;
+      font-weight: 800;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: #0b7f83;
+      margin-bottom: 0.5rem;
+    }
+    .eyebrow.light { color: #56b4b8; }
+
+    h1 {
+      font-size: clamp(2.2rem, 5.5vw, 4.5rem);
+      font-weight: 700;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 .highlight { color: #0b7f83; }
+    h1 .highlight-amber { color: #d4943a; }
+
+    h2 {
+      font-size: clamp(1.6rem, 3.5vw, 2.8rem);
+      font-weight: 600;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.75rem;
+    }
+
+    .subtitle {
+      font-size: clamp(1rem, 1.8vw, 1.35rem);
+      color: #8b949e;
+      max-width: 700px;
+      line-height: 1.6;
+      font-weight: 400;
+    }
+    .subtitle strong { color: #e6edf3; font-weight: 600; }
+
+    .body-text {
+      font-size: clamp(0.95rem, 1.4vw, 1.15rem);
+      line-height: 1.7;
+      color: #8b949e;
+      max-width: 680px;
+    }
+    .body-text strong { color: #e6edf3; }
+
+    /* ── Layout helpers ── */
+    .content-center {
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .content-left {
+      align-self: flex-start;
+      text-align: left;
+      max-width: 800px;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4vw;
+      max-width: 1100px;
+      width: 100%;
+      align-items: start;
+    }
+
+    /* ── Feature cards ── */
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      max-width: 1000px;
+      width: 100%;
+      margin-top: 1rem;
+    }
+    .feature-card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 16px;
+      padding: 1.5rem 1.75rem;
+      text-align: left;
+      transition: background 0.2s;
+    }
+    .feature-card:hover { background: rgba(255,255,255,0.07); }
+    .feature-card .icon {
+      font-size: 1.6rem;
+      margin-bottom: 0.5rem;
+      display: block;
+    }
+    .feature-card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+      color: #e6edf3;
+    }
+    .feature-card p {
+      font-size: 0.85rem;
+      color: #8b949e;
+      line-height: 1.5;
+    }
+
+    /* ── Impact stat ── */
+    .stat-row {
+      display: flex;
+      gap: 3rem;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin: 1.5rem 0;
+    }
+    .stat {
+      text-align: center;
+    }
+    .stat .number {
+      font-size: clamp(2.2rem, 4vw, 3.5rem);
+      font-weight: 700;
+      color: #0b7f83;
+      line-height: 1;
+    }
+    .stat .label {
+      font-size: 0.8rem;
+      color: #8b949e;
+      margin-top: 0.3rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Quote / testimonial ── */
+    .quote {
+      font-size: clamp(1.1rem, 1.8vw, 1.4rem);
+      font-style: italic;
+      color: #c9d1d9;
+      max-width: 700px;
+      line-height: 1.6;
+      border-left: 3px solid #0b7f83;
+      padding-left: 1.5rem;
+      margin: 1rem 0;
+    }
+    .quote cite {
+      display: block;
+      font-style: normal;
+      font-size: 0.85rem;
+      color: #8b949e;
+      margin-top: 0.5rem;
+    }
+
+    /* ── Slide number ── */
+    .slide-number {
+      position: absolute;
+      bottom: 2rem;
+      right: 2.5rem;
+      font-size: 0.7rem;
+      color: #484f58;
+      letter-spacing: 0.1em;
+    }
+
+    /* ── Navigation ── */
+    .nav {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 0.6rem;
+      z-index: 100;
+    }
+    .nav-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #30363d;
+      border: none;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.2s;
+    }
+    .nav-dot.active { background: #0b7f83; transform: scale(1.3); }
+    .nav-dot:hover { background: #58a6ff; }
+
+    .arrow {
+      position: fixed;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #8b949e;
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      font-size: 1.3rem;
+      cursor: pointer;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s, color 0.2s;
+    }
+    .arrow:hover { background: rgba(255,255,255,0.1); color: #e6edf3; }
+    .arrow-left { left: 1.5rem; }
+    .arrow-right { right: 1.5rem; }
+    .arrow.hidden { display: none; }
+
+    /* ── Molecule badges ── */
+    .molecule-badges {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin: 1rem 0;
+    }
+    .badge {
+      background: rgba(11,127,131,0.12);
+      border: 1px solid rgba(11,127,131,0.2);
+      border-radius: 100px;
+      padding: 0.3rem 1rem;
+      font-size: 0.8rem;
+      color: #56b4b8;
+      font-weight: 500;
+    }
+
+    /* ── Pipeline visual ── */
+    .pipeline {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin: 1.5rem 0;
+    }
+    .pipeline-step {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 0.6rem 1.2rem;
+      font-size: 0.85rem;
+      color: #c9d1d9;
+      font-weight: 500;
+    }
+    .pipeline-arrow {
+      color: #484f58;
+      font-size: 1.2rem;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 768px) {
+      .two-col { grid-template-columns: 1fr; gap: 1.5rem; }
+      .feature-grid { grid-template-columns: 1fr; }
+      .stat-row { gap: 1.5rem; }
+      .slide { padding: 4vh 5vw; }
+      .arrow { display: none; }
+    }
+
+    /* ── Animations ── */
+    .fade-in {
+      opacity: 0;
+      transform: translateY(20px);
+      animation: fadeIn 0.6s ease forwards;
+    }
+    .fade-in-d1 { animation-delay: 0.1s; }
+    .fade-in-d2 { animation-delay: 0.2s; }
+    .fade-in-d3 { animation-delay: 0.3s; }
+    .fade-in-d4 { animation-delay: 0.4s; }
+    .fade-in-d5 { animation-delay: 0.5s; }
+
+    @keyframes fadeIn {
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── Keyboard hint ── */
+    .key-hint {
+      position: fixed;
+      bottom: 4.5rem;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.65rem;
+      color: #484f58;
+      letter-spacing: 0.05em;
+      z-index: 50;
+    }
+  </style>
+</head>
+<body>
+
+<div class="slides" id="slides">
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 1 — TITLE
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-teal">
+    <div class="content-center fade-in">
+      <p class="eyebrow light fade-in-d1">Hackathon Submission</p>
+      <h1 class="fade-in-d2">
+        <span class="highlight">QBI</span>
+      </h1>
+      <p style="font-size: clamp(1.1rem, 2vw, 1.6rem); color: #8b949e; margin-bottom: 0.75rem; font-weight: 300;" class="fade-in-d3">
+        CryoET Scan Review
+      </p>
+      <p class="subtitle fade-in-d4">
+        An interactive platform that lets scientists <strong>explore, analyze, and understand</strong>
+        the molecular machinery of life — directly from 3D cryo-electron tomography scans.
+      </p>
+      <div class="molecule-badges fade-in-d5" style="margin-top: 1.5rem;">
+        <span class="badge">Ribosomes</span>
+        <span class="badge">Viruses</span>
+        <span class="badge">Proteins</span>
+        <span class="badge">Ferritin</span>
+        <span class="badge">Amylase</span>
+      </div>
+    </div>
+    <div class="slide-number">01 / 07</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 2 — THE PROBLEM
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-dark">
+    <div class="content-left fade-in">
+      <p class="eyebrow fade-in-d1">The Problem</p>
+      <h2 class="fade-in-d2">CryoET is transforming biology — but the data is overwhelming.</h2>
+      <p class="body-text fade-in-d3" style="max-width: 720px;">
+        Cryo-electron tomography captures 3D snapshots of cells at <strong>near-atomic resolution</strong>.
+        Each scan contains billions of voxels — a dense, complex volume of proteins, membranes,
+        and molecular machines interacting in their native environment.
+      </p>
+      <p class="body-text fade-in-d4" style="max-width: 720px; margin-top: 0.75rem;">
+        <strong>The bottleneck:</strong> scientists spend weeks manually identifying and labeling
+        individual molecules — ribosomes, viruses, enzymes — buried inside these massive 3D volumes.
+        There hasn't been a simple, accessible way to <strong>see, search, and make sense</strong> of it all.
+      </p>
+      <div class="stat-row fade-in-d5" style="margin-top: 1.5rem;">
+        <div class="stat">
+          <div class="number">~10<sup>9</sup></div>
+          <div class="label">Voxels per tomogram</div>
+        </div>
+        <div class="stat">
+          <div class="number">Days → Weeks</div>
+          <div class="label">Manual annotation time</div>
+        </div>
+        <div class="stat">
+          <div class="number">6+</div>
+          <div class="label">Molecule types per scan</div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-number">02 / 07</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 3 — WHAT QBI DOES
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-blue">
+    <div class="content-center fade-in">
+      <p class="eyebrow fade-in-d1">What QBI Does</p>
+      <h2 class="fade-in-d2">From raw data to <span class="highlight">biological insight</span> — in one place.</h2>
+      <p class="subtitle fade-in-d3" style="max-width: 750px;">
+        QBI is a web-based platform that combines interactive 3D visualization with
+        AI-powered molecule detection, giving scientists an intuitive way to explore
+        cryoET data and get answers fast.
+      </p>
+
+      <div class="pipeline fade-in-d4">
+        <span class="pipeline-step">📦 Upload Zarr Scan</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">🧬 AI Detects Molecules</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">🔬 Explore in 3D</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">📊 Get Structured Insights</span>
+      </div>
+
+      <div class="feature-grid fade-in-d5">
+        <div class="feature-card">
+          <span class="icon">🖱️</span>
+          <h3>Interactive 3D Viewer</h3>
+          <p>Orbit, zoom, and slice through tomograms in real time. Navigate X, Y, and Z axes independently to inspect every layer of the volume.</p>
+        </div>
+        <div class="feature-card">
+          <span class="icon">🤖</span>
+          <h3>AI-Powered Detection</h3>
+          <p>One click runs a deep learning model that identifies and classifies molecules — ribosomes, viruses, proteins — across the entire scan.</p>
+        </div>
+        <div class="feature-card">
+          <span class="icon">🏷️</span>
+          <h3>Label Management</h3>
+          <p>Upload expert-curated labels, browse detected molecules by type, inspect individual picks, and validate AI predictions visually.</p>
+        </div>
+        <div class="feature-card">
+          <span class="icon">📋</span>
+          <h3>Automated Analysis Reports</h3>
+          <p>Get structured insights: molecule counts, clustering patterns, spatial distribution, and caveats — generated automatically from your data.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-number">03 / 07</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 4 — WHO IT HELPS
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-amber">
+    <div class="content-left fade-in">
+      <p class="eyebrow fade-in-d1">Who It Helps</p>
+      <h2 class="fade-in-d2">Built for <span class="highlight-amber">structural biologists</span>, by people who understand the workflow.</h2>
+
+      <div class="two-col" style="margin-top: 1.5rem;">
+        <div class="fade-in-d3">
+          <div class="feature-card" style="margin-bottom: 1rem;">
+            <h3 style="color: #d4943a;">🧑‍🔬 The Structural Biologist</h3>
+            <p style="font-size: 0.85rem; color: #8b949e; line-height: 1.6;">
+              "I spend weeks manually picking particles from tomograms. QBI lets me
+              see the whole volume in 3D, run AI detection, and validate results
+              in minutes instead of months."
+            </p>
+          </div>
+          <div class="feature-card">
+            <h3 style="color: #d4943a;">🎓 The Graduate Student</h3>
+            <p style="font-size: 0.85rem; color: #8b949e; line-height: 1.6;">
+              "I'm new to cryoET. QBI's visual interface helps me understand
+              what's inside a tomogram without needing to learn command-line tools
+              or write a single line of code."
+            </p>
+          </div>
+        </div>
+        <div class="fade-in-d4">
+          <div class="feature-card" style="margin-bottom: 1rem;">
+            <h3 style="color: #d4943a;">🏥 The Drug Discovery Researcher</h3>
+            <p style="font-size: 0.85rem; color: #8b949e; line-height: 1.6;">
+              "Understanding how viral particles interact with cellular machinery
+              is critical. QBI's automated analysis helps me quantify these
+              interactions at scale."
+            </p>
+          </div>
+          <div class="feature-card">
+            <h3 style="color: #d4943a;">🌍 The Collaborator</h3>
+            <p style="font-size: 0.85rem; color: #8b949e; line-height: 1.6;">
+              "QBI runs in a browser. I can share a link with colleagues across
+              the world — no software installation, no data downloads, just
+              exploration."
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-number">04 / 07</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 5 — KEY FEATURES DEEP DIVE
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-dark">
+    <div class="content-center fade-in">
+      <p class="eyebrow fade-in-d1">Key Features</p>
+      <h2 class="fade-in-d2">What makes QBI <span class="highlight">different</span>.</h2>
+
+      <div class="feature-grid" style="margin-top: 1rem;">
+        <div class="feature-card fade-in-d2">
+          <span class="icon">🌀</span>
+          <h3>Real-time 3D Volume Rendering</h3>
+          <p>Navigate massive Zarr datasets in the browser with smooth, interactive controls. No downloads, no specialized hardware — just a web browser.</p>
+        </div>
+        <div class="feature-card fade-in-d2">
+          <span class="icon">✂️</span>
+          <h3>Orthogonal Slice Views</h3>
+          <p>Scroll through X, Y, and Z cross-sections simultaneously. Detected molecules are overlaid directly on the slices with color-coded highlights.</p>
+        </div>
+        <div class="feature-card fade-in-d3">
+          <span class="icon">🧠</span>
+          <h3>One-Click AI Inference</h3>
+          <p>Run a trained 3D segmentation model directly from the interface. Real-time progress tracking with live tiling feedback — no terminal needed.</p>
+        </div>
+        <div class="feature-card fade-in-d3">
+          <span class="icon">📊</span>
+          <h3>Intelligent Analysis Engine</h3>
+          <p>Automatically generates structured reports: molecule frequency, spatial clustering, singleton analysis, and validation recommendations.</p>
+        </div>
+        <div class="feature-card fade-in-d4">
+          <span class="icon">📂</span>
+          <h3>Upload Any Zarr</h3>
+          <p>Drag-and-drop your own .zarr folders or point to a local path. Supports multi-resolution (mipmap) levels for fast preview at any scale.</p>
+        </div>
+        <div class="feature-card fade-in-d4">
+          <span class="icon">🔗</span>
+          <h3>Export & Share</h3>
+          <p>Export reports, open scans in 3D Slicer, or share findings with collaborators. The web server handles all the heavy lifting.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-number">05 / 07</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 6 — IMPACT & FUTURE
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-teal">
+    <div class="content-center fade-in">
+      <p class="eyebrow light fade-in-d1">The Impact</p>
+      <h2 class="fade-in-d2">Accelerating the pace of <span class="highlight">molecular discovery</span>.</h2>
+
+      <div class="stat-row fade-in-d3">
+        <div class="stat">
+          <div class="number">100×</div>
+          <div class="label">Faster molecule identification</div>
+        </div>
+        <div class="stat">
+          <div class="number">Zero</div>
+          <div class="label">Software installation required</div>
+        </div>
+        <div class="stat">
+          <div class="number">Any</div>
+          <div class="label">Browser, anywhere in the world</div>
+        </div>
+      </div>
+
+      <div class="quote fade-in-d4">
+        "CryoET is one of the most exciting frontiers in structural biology.
+        The challenge has always been making the data accessible and interpretable.
+        QBI bridges that gap — turning terabytes of raw tomograms into
+        actionable biological insights."
+        <cite>— The QBI Team</cite>
+      </div>
+
+      <div style="margin-top: 1.5rem; text-align: left; max-width: 700px;" class="fade-in-d5">
+        <p class="body-text" style="margin-bottom: 0.5rem;"><strong>What's next?</strong></p>
+        <p class="body-text" style="font-size: 0.9rem;">
+          • <strong>Multi-scan comparison</strong> — compare molecule distributions across different experimental conditions<br>
+          • <strong>Collaborative annotation</strong> — multiple researchers reviewing and refining picks together<br>
+          • <strong>Custom model training</strong> — fine-tune detection for novel molecules directly from the interface<br>
+          • <strong>Public data repository</strong> — a growing library of annotated tomograms for the community
+        </p>
+      </div>
+    </div>
+    <div class="slide-number">06 / 07</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SLIDE 7 — CLOSING
+       ═══════════════════════════════════════════════════════════════ -->
+  <section class="slide slide-bg-white">
+    <div class="content-center fade-in">
+      <p class="eyebrow" style="color: #0b7f83;">Thank You</p>
+      <h1 style="color: #172026; font-size: clamp(2rem, 4vw, 3.5rem);">
+        QBI
+      </h1>
+      <p style="font-size: clamp(1rem, 1.6vw, 1.3rem); color: #65737a; margin-bottom: 0.5rem; font-weight: 300;">
+        CryoET Scan Review
+      </p>
+      <p style="font-size: 0.9rem; color: #8b949e; max-width: 500px; line-height: 1.6; margin-top: 0.5rem;">
+        Making the invisible visible — one tomogram at a time.
+      </p>
+      <div style="margin-top: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center;">
+        <span style="background: #0b7f83; color: white; padding: 0.5rem 1.5rem; border-radius: 100px; font-size: 0.85rem; font-weight: 600;">
+          🧬 Open Source
+        </span>
+        <span style="background: #eef2f3; color: #172026; padding: 0.5rem 1.5rem; border-radius: 100px; font-size: 0.85rem; font-weight: 600; border: 1px solid #d8e0e2;">
+          🌐 Web-Based
+        </span>
+        <span style="background: #eef2f3; color: #172026; padding: 0.5rem 1.5rem; border-radius: 100px; font-size: 0.85rem; font-weight: 600; border: 1px solid #d8e0e2;">
+          🤖 AI-Powered
+        </span>
+      </div>
+      <p style="margin-top: 2.5rem; font-size: 0.75rem; color: #aebdc1;">
+        Built for the CZII CryoET Object Identification Hackathon
+      </p>
+    </div>
+    <div class="slide-number">07 / 07</div>
+  </section>
+
+</div>
+
+<!-- ── Navigation ── -->
+<button class="arrow arrow-left hidden" id="prevBtn" aria-label="Previous slide">←</button>
+<button class="arrow arrow-right" id="nextBtn" aria-label="Next slide">→</button>
+
+<div class="nav" id="nav"></div>
+<div class="key-hint">← → or Space to navigate</div>
+
+<script>
+  const slides = document.getElementById('slides');
+  const nav = document.getElementById('nav');
+  const prevBtn = document.getElementById('prevBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const total = document.querySelectorAll('.slide').length;
+  let current = 0;
+
+  // Build nav dots
+  for (let i = 0; i < total; i++) {
+    const dot = document.createElement('button');
+    dot.className = 'nav-dot' + (i === 0 ? ' active' : '');
+    dot.setAttribute('aria-label', `Go to slide ${i + 1}`);
+    dot.addEventListener('click', () => goTo(i));
+    nav.appendChild(dot);
+  }
+
+  function goTo(index) {
+    if (index < 0) index = 0;
+    if (index >= total) index = total - 1;
+    current = index;
+    slides.style.transform = `translateX(-${current * 100}vw)`;
+    document.querySelectorAll('.nav-dot').forEach((d, i) => {
+      d.classList.toggle('active', i === current);
+    });
+    prevBtn.classList.toggle('hidden', current === 0);
+    nextBtn.classList.toggle('hidden', current === total - 1);
+  }
+
+  function next() { goTo(current + 1); }
+  function prev() { goTo(current - 1); }
+
+  nextBtn.addEventListener('click', next);
+  prevBtn.addEventListener('click', prev);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      next();
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      prev();
+    }
+  });
+
+  // Touch support
+  let touchStartX = 0;
+  document.addEventListener('touchstart', (e) => { touchStartX = e.changedTouches[0].screenX; });
+  document.addEventListener('touchend', (e) => {
+    const diff = touchStartX - e.changedTouches[0].screenX;
+    if (Math.abs(diff) > 50) {
+      diff > 0 ? next() : prev();
+    }
+  });
+</script>
+
+</body>
+</html>

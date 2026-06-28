@@ -2089,10 +2089,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (new URL(req.url, `http://localhost:${port}`).pathname === "/test3d") {
-    req.url = "/test3d.html";
-  }
-
   let filePath;
 
   try {

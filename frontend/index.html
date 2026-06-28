@@ -54,6 +54,14 @@
               <option value="1">Level 1 - mid detail</option>
               <option value="0">Level 0 - full resolution</option>
             </select>
+            <input id="point-size" type="range" min="1" max="9" value="3" hidden aria-hidden="true">
+            <input id="point-limit" type="range" min="8000" max="80000" step="4000" value="38000" hidden aria-hidden="true">
+            <select id="stride-select" hidden aria-hidden="true">
+              <option value="1">1 - dense</option>
+              <option value="2" selected>2 - balanced</option>
+              <option value="3">3 - fast</option>
+              <option value="4">4 - very fast</option>
+            </select>
           </div>
 
           <div class="inference-section">
@@ -93,29 +101,6 @@
             <span id="load-progress"></span>
           </div>
         </section>
-
-        <section class="panel">
-          <h2>Render controls</h2>
-          <div class="control-grid">
-            <label>
-              Point size
-              <input id="point-size" type="range" min="1" max="9" value="3">
-            </label>
-            <label>
-              Density
-              <input id="point-limit" type="range" min="8000" max="80000" step="4000" value="38000">
-            </label>
-            <label>
-              Sample stride
-              <select id="stride-select">
-                <option value="1">1 - dense</option>
-                <option value="2" selected>2 - balanced</option>
-                <option value="3">3 - fast</option>
-                <option value="4">4 - very fast</option>
-              </select>
-            </label>
-          </div>
-        </section>
       </aside>
 
       <section class="viewer-region" aria-label="3D volume and detection review">
@@ -125,29 +110,50 @@
               <p class="eyebrow">Interactive volume</p>
               <h2 id="viewer-title">3D Zarr Preview</h2>
             </div>
-            <div class="tool-buttons" aria-label="3D view tools">
-              <button id="rotate-toggle" type="button" aria-label="Toggle rotation">R</button>
+            <div class="slice-toolbar" aria-label="Orthogonal slice controls">
+              <div class="slice-preview-strip" aria-label="Slice previews">
+                <figure class="slice-preview-tile axis-x">
+                  <canvas id="x-slice-canvas" class="slice-preview-canvas"></canvas>
+                  <figcaption id="x-slice-label">X -</figcaption>
+                </figure>
+                <figure class="slice-preview-tile axis-y">
+                  <canvas id="y-slice-canvas" class="slice-preview-canvas"></canvas>
+                  <figcaption id="y-slice-label">Y -</figcaption>
+                </figure>
+                <figure class="slice-preview-tile axis-z">
+                  <canvas id="z-slice-canvas" class="slice-preview-canvas"></canvas>
+                  <figcaption id="z-slice-label">Z -</figcaption>
+                </figure>
+              </div>
               <div class="slice-slider-stack" aria-label="Orthogonal slice controls">
                 <label class="slice-slider-control" aria-label="X slice">
-                  <span id="x-slice-value">X -</span>
+                  <span class="slice-axis-label axis-x" aria-hidden="true">
+                    <span class="slice-axis-box"></span>
+                    <span id="x-slice-value" class="slice-slider-number">X -</span>
+                  </span>
                   <input id="x-slice-slider" type="range" min="0" max="0" value="0" step="1">
                 </label>
                 <label class="slice-slider-control" aria-label="Y slice">
-                  <span id="y-slice-value">Y -</span>
+                  <span class="slice-axis-label axis-y" aria-hidden="true">
+                    <span class="slice-axis-box"></span>
+                    <span id="y-slice-value" class="slice-slider-number">Y -</span>
+                  </span>
                   <input id="y-slice-slider" type="range" min="0" max="0" value="0" step="1">
                 </label>
                 <label class="slice-slider-control" aria-label="Z slice">
-                  <span id="z-slice-value">Z -</span>
+                  <span class="slice-axis-label axis-z" aria-hidden="true">
+                    <span class="slice-axis-box"></span>
+                    <span id="z-slice-value" class="slice-slider-number">Z -</span>
+                  </span>
                   <input id="z-slice-slider" type="range" min="0" max="0" value="0" step="1">
                 </label>
               </div>
-              <button id="open-slicer" type="button" aria-label="Open volume in 3D Slicer">S</button>
-              <button id="reload-scan" type="button" aria-label="Reload scan">L</button>
             </div>
           </div>
 
           <div id="volume-viewer" class="volume-canvas" aria-label="Interactive 3D Zarr volume renderer">
             <div id="viewer-message" class="viewer-message">Loading sample Zarr data</div>
+            <div id="viewer-annotations" class="viewer-annotations" aria-live="polite"></div>
           </div>
         </section>
 
