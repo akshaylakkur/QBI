@@ -144,6 +144,7 @@ const elements = {
   graphViewer: document.querySelector("#graph-viewer"),
   graphCaption: document.querySelector("#graph-caption"),
   graphPickLabel: document.querySelector("#graph-pick-label"),
+  resetCamera: document.querySelector("#reset-camera"),
   resetGraphCamera: document.querySelector("#reset-graph-camera"),
   viewerRow: document.querySelector(".viewer-row"),
   occlusionFilterPanel: document.querySelector("#occlusion-filter-panel"),
@@ -701,6 +702,10 @@ function syncPickOverlays() {
   }
 
   state.detections.forEach((detection) => {
+    // Keep overlays tied to active cross-sections only.
+    if (visibleSliceAxesForDetection(detection).length === 0) {
+      return;
+    }
     const position = detectionWorldPosition(detection);
     if (!position) {
       return;
@@ -1036,7 +1041,6 @@ function annotationWorldPosition(detection) {
     return detectionSliceWorldPosition(detection, visibleAxes[0]);
   }
   return state.selectedDetection ? detectionWorldPosition(detection) : null;
-  return detectionWorldPosition(detection);
 }
 
 function projectedViewerPosition(detection) {
@@ -1300,6 +1304,19 @@ function createColorizedSliceData(axis, bytes, width, height) {
   });
 
   return textureData;
+}
+
+function clearVolumeSceneExceptPicks() {
+  volumeGroup.children.slice().forEach((child) => {
+    if (child === picksGroup) {
+      return;
+    }
+    volumeGroup.remove(child);
+    disposeObject(child);
+  });
+  if (!volumeGroup.children.includes(picksGroup)) {
+    volumeGroup.add(picksGroup);
+  }
 }
 
 function clearGroup(group) {
@@ -1664,7 +1681,7 @@ function refreshSlicePreviews() {
 }
 
 function renderVolumeScene(payload) {
-  clearGroup(volumeGroup);
+  clearVolumeSceneExceptPicks();
   sliceAxes.forEach((axis) => {
     slicePlaneObjects[axis] = null;
   });
@@ -1814,7 +1831,6 @@ function renderAnalysis(analysis) {
   }
 
   elements.analysisStatus.textContent = payload.reportStatus || analysis?.reportStatus || "Ready";
-  elements.analysisStatus.textContent = analysis.reportStatus || "Ready";
   elements.analysisStatus.classList.remove("active");
 
   // Keywords pills
@@ -1874,8 +1890,6 @@ function renderAnalysis(analysis) {
   }
 
   const report = payload.report || payload.localSummary || analysis?.report || analysis?.localSummary || "";
-  // Report panel
-  const report = analysis.report || analysis.localSummary || "";
   elements.analysisReport.replaceChildren();
   if (structured?.title) {
     const heading = document.createElement("h3");
@@ -1942,19 +1956,11 @@ function renderAnalysis(analysis) {
   const reportError = payload.reportError || analysis?.reportError;
   const reportErrorBody = payload.reportErrorBody || analysis?.reportErrorBody;
   if (reportError || reportErrorBody) {
-  if (analysis.reportWarning) {
-    const warningEl = document.createElement("p");
-    warningEl.className = "analysis-warning";
-    warningEl.textContent = `⚠ ${analysis.reportWarning}`;
-    elements.analysisReport.append(warningEl);
-  }
-  if (analysis.reportError || analysis.reportErrorBody) {
     const heading = document.createElement("h3");
     heading.textContent = "Analysis Error";
     const errorBlock = document.createElement("pre");
     errorBlock.className = "analysis-error";
     errorBlock.textContent = [reportError, reportErrorBody].filter(Boolean).join("\n\n");
-    errorBlock.textContent = [analysis.reportError, analysis.reportErrorBody].filter(Boolean).join("\n\n");
     elements.analysisReport.append(heading, errorBlock);
   }
 }
@@ -2866,29 +2872,6 @@ function animate() {
   if (!elements.graphPanel.hidden) {
     graphControls.update();
     graphRenderer.render(graphScene, graphCamera);
-  }
-}
-
-async function fetchClaudeAnalysis(scanPath) {
-  if (!scanPath) {
-    return;
-  }
-  analysisRequestScan = scanPath;
-  elements.analysisStatus.textContent = "Generating AI analysis...";
-  elements.analysisStatus.classList.add("active");
-  try {
-    const result = await fetchJson("/api/analysis", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ zarrPath: scanPath })
-    });
-    if (analysisRequestScan === scanPath) {
-      renderAnalysis(result);
-    }
-  } catch {
-    if (analysisRequestScan === scanPath) {
-      elements.analysisStatus.classList.remove("active");
-    }
   }
 }
 
