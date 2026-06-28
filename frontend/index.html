@@ -63,6 +63,40 @@
               <option value="4">4 - very fast</option>
             </select>
           </div>
+
+          <div class="inference-section">
+            <button id="run-inference" type="button" class="inference-button">
+              <span class="inference-icon">▶</span>
+              Run Model Inference
+            </button>
+            <div id="inference-progress" class="inference-progress" hidden>
+              <div class="inference-progress-bar">
+                <span id="inference-progress-fill" class="inference-progress-fill"></span>
+              </div>
+              <span id="inference-status" class="inference-status-text">Starting...</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Volume</h2>
+            <span id="point-count" class="status-pill">0 points</span>
+          </div>
+          <div class="metric-list">
+            <div>
+              <span>Shape</span>
+              <strong id="volume-shape">-</strong>
+            </div>
+            <div>
+              <span>Intensity range</span>
+              <strong id="volume-range">-</strong>
+            </div>
+            <div>
+              <span>Sampling stride</span>
+              <strong id="volume-stride">-</strong>
+            </div>
+          </div>
           <div class="progress-track" aria-label="Loading progress">
             <span id="load-progress"></span>
           </div>

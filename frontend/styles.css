@@ -1045,6 +1045,95 @@ canvas.slice-preview {
   font-size: 0.82rem;
 }
 
+.inference-section {
+  margin-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.inference-button {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--teal);
+  border-radius: 8px;
+  background: var(--teal);
+  color: #ffffff;
+  font-weight: 800;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.inference-button:hover {
+  background: var(--teal-dark);
+}
+
+.inference-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.inference-button.is-running {
+  background: #425157;
+  border-color: #425157;
+}
+
+.inference-icon {
+  font-size: 1rem;
+}
+
+.inference-progress {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.inference-progress[hidden] {
+  display: none;
+}
+
+.inference-progress-bar {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #dfe7e9;
+}
+
+.inference-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--teal);
+  transition: width 0.3s ease;
+  width: 0%;
+}
+
+.inference-status-text {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tqdm-bar {
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.5px;
+  color: var(--teal);
+  background: rgba(11, 127, 131, 0.08);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
 .object-facts {
   display: grid;
   gap: 12px;

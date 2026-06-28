@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backend"
+version = "0.1.0"
+description = "PyTorch-native 3D segmentation for CryoET particle identification (czii challenge)"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "scipy",
+    "zarr",
+    "ome-zarr",
+    "copick",
+    "copick-utils",
+    "pyyaml",
+    "tqdm",
+    "tensorboard",
+    "pandas",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
