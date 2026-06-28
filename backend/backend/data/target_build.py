@@ -1,4 +1,10 @@
-"""Build sphere-based segmentation targets from copick picks (port of DeepFindET)."""
+"""Build sphere-based segmentation targets from copick picks (port of DeepFindET).
+
+Targets are written with *contiguous model-class indices* (see ``labels.py``),
+so copick label 8 (membrane) maps to class 7, and particle labels 1..6 map to
+classes 1..6. Background is 0. This keeps the dense label volume inside
+``0..n_class-1`` so downstream one-hot / softmax / argmax are well-defined.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,7 @@ import numpy as np
 from scipy import ndimage
 from tqdm import tqdm
 
+from ..labels import LABEL_TO_CLASS
 from . import copick_io
 
 
@@ -81,8 +88,9 @@ def build_targets_for_run(
         for obj in root.pickable_objects:
             if obj.is_particle:
                 r = getattr(obj, "radius", None)
+                # remap copick label -> contiguous model-class index
                 particle_targets[obj.name] = {
-                    "label": obj.label,
+                    "label": LABEL_TO_CLASS.get(obj.label, 0),
                     "user_id": None,
                     "session_id": None,
                     "radius": (r / voxel_size) if r else 0.0,
@@ -90,8 +98,12 @@ def build_targets_for_run(
 
     target_vol = copick_io.get_empty_target(config_path, tomo_id, voxel_size)
 
-    # Overlay existing segmentations (e.g. membrane) if provided
+    # Overlay existing segmentations (e.g. membrane) if provided.
+    # `info["label"]` here is expected to be a *model-class index* (already
+    # remapped by the caller); we additionally remap the stored volume in case
+    # it still carries raw copick labels.
     if seg_targets:
+        from ..labels import remap_volume
         for name, info in seg_targets.items():
             segs = root.get_run(tomo_id).get_segmentations(
                 name=name,
@@ -102,7 +114,8 @@ def build_targets_for_run(
             )
             for seg in segs:
                 vol = zarr.open(seg.zarr(), mode="r")["0"][:]
-                np.maximum(target_vol, vol.astype(np.uint8) * info["label"], out=target_vol)
+                vol = remap_volume(vol.astype(np.uint8))
+                np.maximum(target_vol, vol * info["label"], out=target_vol)
 
     # Precompute sphere masks per class (radius in voxels)
     spheres = {}
@@ -155,7 +168,7 @@ def build_targets(
             if obj.is_particle:
                 r = getattr(obj, "radius", None)
                 particle_targets[obj.name] = {
-                    "label": obj.label,
+                    "label": LABEL_TO_CLASS.get(obj.label, 0),
                     "user_id": None,
                     "session_id": None,
                     "radius": (r / voxel_size) if r else 0.0,

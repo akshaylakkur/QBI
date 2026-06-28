@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 
+from ..labels import LABEL_TO_CLASS, PARTICLE_CLASSES
 from . import copick_io
 from .augment import Augment3D
 
@@ -23,9 +24,11 @@ def index_picks(
     targets: Optional[Dict[str, dict]] = None,
     voxel_size: float = 10.0,
 ) -> List[Tuple[str, float, float, float, int]]:
-    """Flatten all picks across runs into a list of (tomo_id, x, y, z, label).
+    """Flatten all picks across runs into a list of (tomo_id, x, y, z, class).
 
-    Coordinates are in VOXEL units (Angstrom / voxel_size).
+    Coordinates are in VOXEL units (Angstrom / voxel_size). The returned class
+    index is the *contiguous model-class index* (copick label remapped via
+    ``LABEL_TO_CLASS``), so it is always in ``0..n_class-1``.
     """
     root = copick_io.get_copick_root(config_path)
     if targets is None:
@@ -38,7 +41,7 @@ def index_picks(
     for tomo_id in tomo_ids:
         for name, info in targets.items():
             obj = root.get_object(name)
-            label = obj.label
+            cls = LABEL_TO_CLASS.get(obj.label, 0)  # model-class index
             coords = copick_io.get_picks(
                 config_path, tomo_id, name,
                 user_id=info.get("user_id"),
@@ -48,7 +51,7 @@ def index_picks(
                 continue
             vcoords = coords / voxel_size  # (N,3) x,y,z in voxels
             for (x, y, z) in vcoords:
-                flat.append((tomo_id, float(x), float(y), float(z), int(label)))
+                flat.append((tomo_id, float(x), float(y), float(z), int(cls)))
     return flat
 
 
@@ -190,15 +193,27 @@ class CryoETPatchDataset(IterableDataset):
         self.seed = seed
         self._rng = random.Random(seed)
 
-        # Index picks for all provided tomo_ids
+        # Index picks for all provided tomo_ids (class indices already remapped)
         self.picks = index_picks(config_path, tomo_ids, targets, voxel_size)
-        # group by class label
+        # group by class index
         self.by_class: Dict[int, List[int]] = defaultdict(list)
         for i, (*_p, label) in enumerate(self.picks):
             self.by_class[label].append(i)
         self.class_labels = sorted(self.by_class.keys())
         if not self.class_labels:
             raise ValueError("No picks found for the given tomo_ids/targets.")
+
+        # Per-tomogram pick coordinate arrays (voxel units) for background
+        # rejection. Keyed by tomo_id -> (N,3) float array of (x,y,z).
+        self._picks_by_tomo: Dict[str, np.ndarray] = defaultdict(list)
+        for (t, x, y, z, _cls) in self.picks:
+            self._picks_by_tomo[t].append((x, y, z))
+        self._picks_by_tomo = {
+            t: np.asarray(v, dtype=np.float32) for t, v in self._picks_by_tomo.items()
+        }
+        # Max particle radius in voxels (used as exclusion distance for bg
+        # sampling). Default 15 voxels (150 A / 10 A) if unknown.
+        self._bg_exclude = max(15.0, self._max_radius_voxels(config_path, voxel_size))
 
         # Tomogram pool
         self.pool = pool or TomogramPool(
@@ -230,17 +245,30 @@ class CryoETPatchDataset(IterableDataset):
     def set_pool(self, pool: TomogramPool) -> None:
         self.pool = pool
 
+    # -- helpers ---------------------------------------------------------
+    @staticmethod
+    def _max_radius_voxels(config_path: str, voxel_size: float) -> float:
+        """Largest particle radius in voxels across pickable objects."""
+        try:
+            objs = copick_io.get_pickable_objects(config_path)
+        except Exception:
+            return 15.0
+        r = 0.0
+        for o in objs:
+            if o.get("is_particle") and o.get("radius"):
+                r = max(r, float(o["radius"]) / float(voxel_size))
+        return r or 15.0
+
     # -- sampling --------------------------------------------------------
     def _sample_indices(self) -> List[int]:
         n_bg = int(round(self.batch_size * self.background_ratio))
         n_fg = self.batch_size - n_bg
         chosen: List[int] = []
         if n_fg > 0:
-            # cycle through foreground classes for balance
-            fg_labels = [l for l in self.class_labels if l != 9 and l != 8]
-            # foreground particle labels only (exclude background/membrane)
-            fg_labels = [l for l in self.class_labels if l in
-                         [1, 2, 3, 4, 5, 6]] or self.class_labels
+            # cycle through foreground particle classes for balance
+            fg_labels = [l for l in self.class_labels if l in PARTICLE_CLASSES]
+            if not fg_labels:
+                fg_labels = list(self.class_labels)
             for i in range(n_fg):
                 lbl = fg_labels[i % len(fg_labels)]
                 pool = self.by_class[lbl]
@@ -248,13 +276,27 @@ class CryoETPatchDataset(IterableDataset):
         return chosen
 
     def _sample_background_index(self) -> Tuple[str, float, float, float]:
-        """Random background location inside a random loaded tomo."""
+        """Random background location inside a loaded tomo, avoiding picks.
+
+        Rejects candidates within ``_bg_exclude`` voxels (plus ``l_rnd`` jitter)
+        of any particle pick so that "background" patches actually contain
+        background rather than accidentally overlapping a particle.
+        """
         tid = self._rng.choice(self._pool_loaded_ids)
         shape = self.pool.shape(tid)
         p = self.p_in
-        x = self._rng.randint(p, shape[2] - p)
-        y = self._rng.randint(p, shape[1] - p)
-        z = self._rng.randint(p, shape[0] - p)
+        picks = self._picks_by_tomo.get(tid)
+        excl = self._bg_exclude + self.l_rnd
+        for _ in range(16):  # try up to 16 times to find a clean location
+            x = self._rng.randint(p, shape[2] - p)
+            y = self._rng.randint(p, shape[1] - p)
+            z = self._rng.randint(p, shape[0] - p)
+            if picks is None or picks.shape[0] == 0:
+                return tid, float(x), float(y), float(z)
+            d = np.sqrt(((picks - np.array([x, y, z], dtype=np.float32)) ** 2).sum(1))
+            if d.min() > excl:
+                return tid, float(x), float(y), float(z)
+        # fall back to the last candidate if we couldn't find a clean one
         return tid, float(x), float(y), float(z)
 
     # -- iteration -------------------------------------------------------

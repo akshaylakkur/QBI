@@ -2,12 +2,51 @@ const http = require("node:http");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const os = require("node:os");
+const { spawn } = require("node:child_process");
+const { EventEmitter } = require("node:events");
 
 const port = Number.parseInt(process.env.PORT || "3000", 10);
 const publicDir = __dirname;
 const sampleDir = path.join(__dirname, "sample_data");
 const uploadsDir = path.join(__dirname, "uploaded_scans");
+const labelUploadsDir = path.join(__dirname, "uploaded_labels");
+const predictionsDir = path.join(__dirname, "predictions");
+const slicerExportDir = path.join(os.tmpdir(), "qbi-slicer-exports");
 const volumeCache = new Map();
+const volumeLoadCache = new Map();
+const sliceCache = new Map();
+const sliceLoadCache = new Map();
+let sliceCacheBytes = 0;
+const maxSliceCacheBytes = 96 * 1024 * 1024;
+const localScans = new Map();
+const pickCache = new Map();
+
+// Inference progress tracking (SSE)
+const inferenceEmitters = new Map();
+
+function loadEnvFile() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+
+  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) {
+      return;
+    }
+    const separator = trimmed.indexOf("=");
+    const key = trimmed.slice(0, separator).trim();
+    const value = trimmed.slice(separator + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  });
+}
+
+loadEnvFile();
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -36,10 +75,20 @@ function sendJson(res, statusCode, body) {
   send(res, statusCode, JSON.stringify(body), "application/json; charset=utf-8");
 }
 
-function sendBuffer(res, statusCode, body, contentType = "application/octet-stream") {
+function sendBuffer(res, statusCode, body, contentType = "application/octet-stream", extraHeaders = {}) {
   res.writeHead(statusCode, {
     "Content-Type": contentType,
-    "Content-Length": body.length
+    "Content-Length": body.length,
+    ...extraHeaders
+  });
+  res.end(body);
+}
+
+function sendDownload(res, body, filename, contentType = "application/octet-stream") {
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": body.length,
+    "Content-Disposition": `attachment; filename="${filename}"`
   });
   res.end(body);
 }
@@ -62,6 +111,10 @@ function safeSegment(value) {
 }
 
 function resolveScanPath(scanPath) {
+  if (scanPath?.startsWith("local:")) {
+    return localScans.get(scanPath) || null;
+  }
+
   const decoded = decodeURIComponent(scanPath || "");
   const normalized = path.normalize(decoded).replace(/^(\.\.[/\\])+/, "");
   const filePath = path.join(__dirname, normalized);
@@ -72,6 +125,759 @@ function resolveScanPath(scanPath) {
   }
 
   return filePath;
+}
+
+async function readRequestJson(req) {
+  const chunks = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    chunks.push(chunk);
+    total += chunk.length;
+    if (total > 1_000_000) {
+      throw new Error("Request body too large");
+    }
+  }
+
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+async function readMultipartFolder(req, targetRoot, maxBytes = 1_000_000_000) {
+  await fsp.mkdir(targetRoot, { recursive: true });
+  const chunks = [];
+  let total = 0;
+
+  req.on("data", (chunk) => {
+    chunks.push(chunk);
+    total += chunk.length;
+    if (total > maxBytes) {
+      req.destroy();
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    req.on("error", reject);
+    req.on("end", async () => {
+      try {
+        const boundaryMatch = /boundary=(.+)$/.exec(req.headers["content-type"] || "");
+        if (!boundaryMatch) {
+          resolve({ error: "Multipart boundary not found", files: 0 });
+          return;
+        }
+
+        const boundary = `--${boundaryMatch[1]}`;
+        const body = Buffer.concat(chunks);
+        const parts = body.toString("latin1").split(boundary).slice(1, -1);
+        let files = 0;
+
+        for (const part of parts) {
+          const separator = part.indexOf("\r\n\r\n");
+          if (separator === -1) {
+            continue;
+          }
+
+          const headers = part.slice(0, separator);
+          const filenameMatch = /filename="([^"]+)"/.exec(headers);
+          if (!filenameMatch) {
+            continue;
+          }
+
+          const relativeName = filenameMatch[1].split(/[\\/]/).map(safeSegment).join(path.sep);
+          const targetPath = path.join(targetRoot, relativeName);
+          if (!targetPath.startsWith(targetRoot)) {
+            continue;
+          }
+
+          const payload = Buffer.from(part.slice(separator + 4, -2), "latin1");
+          await fsp.mkdir(path.dirname(targetPath), { recursive: true });
+          await fsp.writeFile(targetPath, payload);
+          files += 1;
+        }
+
+        resolve({ files });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+async function listZarrLevels(zarrPath) {
+  let entries = [];
+  try {
+    entries = await fsp.readdir(zarrPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const levels = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const metadataPath = path.join(zarrPath, entry.name, ".zarray");
+    if (fs.existsSync(metadataPath)) {
+      levels.push(entry.name);
+    }
+  }
+
+  return levels.sort((a, b) => {
+    const numericA = Number(a);
+    const numericB = Number(b);
+    if (Number.isFinite(numericA) && Number.isFinite(numericB)) {
+      return numericB - numericA;
+    }
+    return b.localeCompare(a);
+  });
+}
+
+async function readZarrLevelShapes(zarrPath) {
+  const levels = await listZarrLevels(zarrPath);
+  const shapes = {};
+
+  await Promise.all(levels.map(async (level) => {
+    try {
+      const metadata = await readJson(path.join(zarrPath, level, ".zarray"));
+      const [z, y, x] = metadata.shape;
+      shapes[level] = { z, y, x };
+    } catch {
+      // Ignore malformed levels here; the loader will surface the error if used.
+    }
+  }));
+
+  return shapes;
+}
+
+function formatMoleculeName(value) {
+  return String(value || "unknown molecule")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function pickColor(type, index) {
+  const palette = [
+    "#0ea5a6",
+    "#f97316",
+    "#7c3aed",
+    "#22c55e",
+    "#ef4444",
+    "#3b82f6",
+    "#d946ef",
+    "#eab308"
+  ];
+  return palette[index % palette.length];
+}
+
+function pickRadiusAngstrom(type) {
+  const radii = {
+    "apo-ferritin": 60,
+    "beta-amylase": 65,
+    "beta-galactosidase": 90,
+    "ribosome": 150,
+    "thyroglobulin": 130,
+    "virus-like-particle": 135
+  };
+  return radii[type] || 80;
+}
+
+const moleculeDifficulty = {
+  "apo-ferritin": "easy",
+  "beta-amylase": "impossible, not scored",
+  "beta-galactosidase": "hard",
+  "ribosome": "easy",
+  "thyroglobulin": "hard",
+  "virus-like-particle": "easy"
+};
+
+function buildMoleculeAggregation(detections, jsonFiles = 0, volume = null) {
+  const groups = new Map();
+  detections.forEach((detection) => {
+    const molecule = detection.molecule || detection.type || "unknown";
+    if (!groups.has(molecule)) {
+      groups.set(molecule, {
+        molecule,
+        label: detection.type || formatMoleculeName(molecule),
+        color: detection.color || pickColor(molecule, groups.size),
+        difficulty: moleculeDifficulty[molecule] || "unknown",
+        count: 0
+      });
+    }
+    groups.get(molecule).count += 1;
+  });
+
+  const total = detections.length;
+  const items = [...groups.values()]
+    .sort((a, b) => b.count - a.count)
+    .map((item) => {
+      const clusterThresholdAngstroms = Math.max(80, pickRadiusAngstrom(item.molecule) * 1.5);
+      const clusters = clusterDetections(
+        detections.filter((detection) => detection.molecule === item.molecule),
+        clusterThresholdAngstroms
+      );
+
+      return {
+        ...item,
+        frequencyPercent: total > 0 ? (item.count / total) * 100 : 0,
+        clusterThresholdAngstroms,
+        clusterCount: clusters.length,
+        singletonClusters: clusters.filter((cluster) => cluster.count === 1).length,
+        multiPickClusters: clusters.filter((cluster) => cluster.count > 1).length,
+        largestClusterSize: clusters.reduce((max, cluster) => Math.max(max, cluster.count), 0),
+        clusters: clusters.map((cluster, clusterIndex) => ({
+          id: `${item.molecule}-cluster-${String(clusterIndex + 1).padStart(3, "0")}`,
+          count: cluster.count,
+          centroid: cluster.centroid,
+          bounds: cluster.bounds,
+          points: cluster.points
+        }))
+      };
+    });
+
+  return {
+    totalPicks: total,
+    jsonFiles,
+    volume,
+    totalClusters: items.reduce((sum, item) => sum + item.clusterCount, 0),
+    items
+  };
+}
+
+function buildVolumeMetadata(shape, spacing) {
+  const dimensions = {
+    z: Number(shape?.z || 0),
+    y: Number(shape?.y || 0),
+    x: Number(shape?.x || 0)
+  };
+  const voxelSpacing = spacing
+    ? {
+        z: Number(spacing.z || 1),
+        y: Number(spacing.y || 1),
+        x: Number(spacing.x || 1)
+      }
+    : { z: 1, y: 1, x: 1 };
+  const physicalSizeAngstroms = {
+    z: dimensions.z * voxelSpacing.z,
+    y: dimensions.y * voxelSpacing.y,
+    x: dimensions.x * voxelSpacing.x
+  };
+
+  return {
+    dimensions,
+    voxelSpacing,
+    physicalSizeAngstroms
+  };
+}
+
+function clusterDetections(points, thresholdAngstroms) {
+  const clusters = [];
+  const visited = new Set();
+
+  function distance(a, b) {
+    const dx = a.physical.x - b.physical.x;
+    const dy = a.physical.y - b.physical.y;
+    const dz = a.physical.z - b.physical.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  for (let index = 0; index < points.length; index += 1) {
+    if (visited.has(index)) {
+      continue;
+    }
+
+    const queue = [index];
+    const clusterIndexes = [];
+    visited.add(index);
+
+    while (queue.length > 0) {
+      const current = queue.pop();
+      clusterIndexes.push(current);
+
+      for (let candidate = 0; candidate < points.length; candidate += 1) {
+        if (visited.has(candidate)) {
+          continue;
+        }
+        if (distance(points[current], points[candidate]) <= thresholdAngstroms) {
+          visited.add(candidate);
+          queue.push(candidate);
+        }
+      }
+    }
+
+    const members = clusterIndexes.map((clusterIndex) => points[clusterIndex]);
+    const count = members.length;
+    const centroid = {
+      x: members.reduce((sum, item) => sum + item.physical.x, 0) / count,
+      y: members.reduce((sum, item) => sum + item.physical.y, 0) / count,
+      z: members.reduce((sum, item) => sum + item.physical.z, 0) / count
+    };
+    const bounds = members.reduce((acc, item) => {
+      acc.min.x = Math.min(acc.min.x, item.physical.x);
+      acc.min.y = Math.min(acc.min.y, item.physical.y);
+      acc.min.z = Math.min(acc.min.z, item.physical.z);
+      acc.max.x = Math.max(acc.max.x, item.physical.x);
+      acc.max.y = Math.max(acc.max.y, item.physical.y);
+      acc.max.z = Math.max(acc.max.z, item.physical.z);
+      return acc;
+    }, {
+      min: { x: Number.POSITIVE_INFINITY, y: Number.POSITIVE_INFINITY, z: Number.POSITIVE_INFINITY },
+      max: { x: Number.NEGATIVE_INFINITY, y: Number.NEGATIVE_INFINITY, z: Number.NEGATIVE_INFINITY }
+    });
+
+    clusters.push({
+      count,
+      centroid,
+      bounds,
+      points: members.map((member) => ({
+        id: member.id,
+        voxel: member.voxel,
+        physical: member.physical
+      }))
+    });
+  }
+
+  clusters.sort((a, b) => b.count - a.count);
+  return clusters;
+}
+
+function buildLocalAnalysisSummary(aggregation) {
+  if (!aggregation.items.length) {
+    return "No uploaded molecule labels were available for analysis.";
+  }
+
+  const dominant = aggregation.items[0];
+  const hardItems = aggregation.items.filter((item) => item.difficulty.includes("hard"));
+  const easyItems = aggregation.items.filter((item) => item.difficulty === "easy");
+
+  return [
+    "### Dataset Composition",
+    `The uploaded labels contain ${aggregation.totalPicks.toLocaleString()} curated molecule picks across ${aggregation.items.length} scored molecule classes. The most frequent class is ${dominant.label} with ${dominant.count.toLocaleString()} picks (${dominant.frequencyPercent.toFixed(1)}%).`,
+    "### Biological Signal",
+    "The frequencies can support dataset-level quality control and hypothesis generation, but they should not be treated as direct drug-response evidence by themselves. CryoET pick counts are affected by sample preparation, annotation policy, tomogram coverage, particle visibility, and scoring difficulty.",
+    "### Downstream Use",
+    `Easy classes (${easyItems.map((item) => item.label).join(", ") || "none"}) are useful as positive controls for viewer alignment and label quality. Hard classes (${hardItems.map((item) => item.label).join(", ") || "none"}) are better interpreted cautiously and may be useful for benchmarking model sensitivity.`,
+    "### Drug Discovery Relevance",
+    "This summary can help prioritize downstream review by showing which complexes are abundant or sparse in the uploaded run. To connect this to drug mechanism, the counts would need comparison against matched control/treatment tomograms, replicate runs, and normalized acquisition volume."
+  ].join("\n\n");
+}
+
+function extractClaudeText(payload) {
+  const parts = [];
+  for (const content of payload?.content || []) {
+    if (typeof content?.text === "string") {
+      parts.push(content.text);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+function normalizeInsightTone(value) {
+  const tone = String(value || "analytical").toLowerCase();
+  if (tone === "positive" || tone === "warning" || tone === "serious") {
+    return tone;
+  }
+  return "analytical";
+}
+
+function buildStructuredFallbackAnalysis(aggregation) {
+  if (!aggregation.items.length) {
+    return {
+      title: "CryoET Object-Pick Label Summary",
+      headline: "No uploaded molecule labels were available for analysis.",
+      insights: [],
+      datasetSummary: "No uploaded molecule labels were available for analysis.",
+      caveats: [],
+      nextSteps: []
+    };
+  }
+
+  const dominant = aggregation.items[0];
+  return {
+    title: "CryoET Object-Pick Label Summary",
+    headline: `The dataset is dominated by ${dominant.label.toLowerCase()} picks, but clustering remains mostly sparse.`,
+    insights: aggregation.items.map((item) => ({
+      tone: item.difficulty === "easy" ? "positive" : item.difficulty.includes("hard") ? "warning" : "analytical",
+      label: `${item.label}: ${item.count.toLocaleString()} picks`,
+      text: `Represents ${item.frequencyPercent.toFixed(1)}% of the uploaded picks across ${item.clusterCount} clusters. Singleton clusters: ${item.singletonClusters}; largest cluster: ${item.largestClusterSize}.`,
+      evidence: [
+        `${item.count.toLocaleString()} picks`,
+        `${item.frequencyPercent.toFixed(1)}% frequency`,
+        `${item.clusterCount} clusters`
+      ]
+    })),
+    datasetSummary: `The uploaded labels contain ${aggregation.totalPicks.toLocaleString()} curated molecule picks across ${aggregation.items.length} molecular classes, spanning a volume of ${aggregation.volume?.dimensions?.z || 0} × ${aggregation.volume?.dimensions?.y || 0} × ${aggregation.volume?.dimensions?.x || 0} voxels.`,
+    caveats: [
+      "This is one tomographic volume, so the result is descriptive rather than generalizable.",
+      "High singleton rates can reflect true sparsity, annotation fragmentation, or boundary effects."
+    ],
+    nextSteps: [
+      "Compare against matched controls or replicate volumes before making biological claims.",
+      "Use the cluster structure to inspect whether the same molecule repeatedly accumulates in the same subregions."
+    ]
+  };
+}
+
+function buildClaudeAnalysisInput(aggregation) {
+  return {
+    volume: aggregation.volume,
+    totalPicks: aggregation.totalPicks,
+    totalClusters: aggregation.totalClusters,
+    jsonFiles: aggregation.jsonFiles,
+    items: aggregation.items.map((item) => ({
+      molecule: item.molecule,
+      label: item.label,
+      difficulty: item.difficulty,
+      count: item.count,
+      frequencyPercent: Number(item.frequencyPercent.toFixed(3)),
+      clusterThresholdAngstroms: Number(item.clusterThresholdAngstroms.toFixed(3)),
+      clusterCount: item.clusterCount,
+      singletonClusters: item.singletonClusters,
+      multiPickClusters: item.multiPickClusters,
+      largestClusterSize: item.largestClusterSize,
+      clusters: item.clusters.map((cluster) => ({
+        id: cluster.id,
+        count: cluster.count,
+        centroid: {
+          x: Number(cluster.centroid.x.toFixed(3)),
+          y: Number(cluster.centroid.y.toFixed(3)),
+          z: Number(cluster.centroid.z.toFixed(3))
+        },
+        bounds: {
+          min: {
+            x: Number(cluster.bounds.min.x.toFixed(3)),
+            y: Number(cluster.bounds.min.y.toFixed(3)),
+            z: Number(cluster.bounds.min.z.toFixed(3))
+          },
+          max: {
+            x: Number(cluster.bounds.max.x.toFixed(3)),
+            y: Number(cluster.bounds.max.y.toFixed(3)),
+            z: Number(cluster.bounds.max.z.toFixed(3))
+          }
+        }
+      }))
+    }))
+  };
+}
+
+function buildClaudeSystemPrompt() {
+  return [
+    "You analyze CryoET object-pick label summaries for research triage.",
+    "Be scientifically cautious but still useful.",
+    "Use the supplied cluster and frequency statistics to generate hypothesis-level interpretations, not certainty.",
+    "Do not claim clinical, mechanistic, or drug-response conclusions from a single uploaded label folder.",
+    "If a pattern is only suggestive, say it is suggestive and explain why.",
+    "Do not repeat the molecule name as the only label; produce interpretive labels such as high frequency, sparse clustering, possible enrichment, or cautionary exclusion.",
+    "Where a broad biological implication is plausible, mention it as a hypothesis only and tie it directly to the observed clustering or frequency pattern.",
+    "Do not force disease or metabolism claims when the data does not support them.",
+    "Use four tone tags exactly: positive, analytical, warning, serious.",
+    "Positive means a constructive signal or robust pattern.",
+    "Analytical means a neutral measurement-based observation.",
+    "Warning means a caveat, ambiguity, or potential artifact.",
+    "Serious means exclusion, a strong caution, or an important limitation.",
+    "Return valid JSON only. Do not use markdown fences.",
+    "Required JSON shape: {\"title\": string, \"headline\": string, \"insights\": [{\"tone\": string, \"label\": string, \"text\": string, \"evidence\": [string]}], \"datasetSummary\": string, \"caveats\": [string], \"nextSteps\": [string]}",
+    "Keep the output concise but substantive."
+  ].join(" ");
+}
+
+function buildClaudeUserPrompt(aggregation) {
+  const input = buildClaudeAnalysisInput(aggregation);
+  return [
+    "Create a research-style interpretation from the JSON below.",
+    "Focus on how frequency, cluster size, singleton rate, and cluster concentration might relate to biological signal versus annotation noise.",
+    "Generate insight labels that a UI can display as colored cards, with a concise interpretive label and a supporting explanation.",
+    "Use labels like 'High frequency of thyroglobulin', 'Sparse clustering for beta galactosidase', 'Possible enrichment of ribosome signal', or 'Beta amylase excluded from scoring'.",
+    "Avoid labels that are only the molecule name.",
+    "Include molecule-specific insights where appropriate, but also include cross-cutting insights when multiple molecules show a comparable pattern.",
+    "If a specific disease or metabolism hypothesis is not strongly supported, say that it remains speculative rather than forcing a claim.",
+    "Mention the score-exclusion status for beta amylase explicitly.",
+    "Only use the fields in the JSON and do not infer extra measurements.",
+    "If a molecule has no observations, do not fabricate one.",
+    "JSON input:",
+    JSON.stringify(input, null, 2)
+  ].join("\n\n");
+}
+
+function parseClaudeAnalysisJson(text) {
+  const cleaned = text.trim();
+  if (!cleaned) {
+    return null;
+  }
+
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+
+  const candidate = cleaned.slice(start, end + 1);
+  try {
+    const parsed = JSON.parse(candidate);
+    const insights = Array.isArray(parsed.insights) ? parsed.insights.map((insight) => ({
+      tone: normalizeInsightTone(insight.tone),
+      label: String(insight.label || "").trim(),
+      text: String(insight.text || "").trim(),
+      evidence: Array.isArray(insight.evidence) ? insight.evidence.map((entry) => String(entry)) : []
+    })).filter((insight) => insight.label || insight.text) : [];
+
+    return {
+      title: String(parsed.title || "CryoET Object-Pick Label Summary").trim(),
+      headline: String(parsed.headline || "").trim(),
+      insights,
+      datasetSummary: String(parsed.datasetSummary || "").trim(),
+      caveats: Array.isArray(parsed.caveats) ? parsed.caveats.map((entry) => String(entry)).filter(Boolean) : [],
+      nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps.map((entry) => String(entry)).filter(Boolean) : []
+    };
+  } catch {
+    return null;
+  }
+}
+
+function structuredAnalysisToMarkdown(structured) {
+  if (!structured) {
+    return "";
+  }
+
+  const blocks = [];
+  if (structured.title) {
+    blocks.push(`### ${structured.title}`);
+  }
+  if (structured.headline) {
+    blocks.push(structured.headline);
+  }
+  if (structured.datasetSummary) {
+    blocks.push(`### Dataset Summary\n${structured.datasetSummary}`);
+  }
+  if (structured.insights?.length) {
+    const lines = structured.insights.map((insight) => `- [${insight.tone}] ${insight.label}: ${insight.text}`);
+    blocks.push(`### Insight Cards\n${lines.join("\n")}`);
+  }
+  if (structured.caveats?.length) {
+    blocks.push(`### Caveats\n${structured.caveats.map((item) => `- ${item}`).join("\n")}`);
+  }
+  if (structured.nextSteps?.length) {
+    blocks.push(`### Next Validation Steps\n${structured.nextSteps.map((item) => `- ${item}`).join("\n")}`);
+  }
+  return blocks.join("\n\n");
+}
+
+async function generateClaudeAnalysis(aggregation) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    const structured = buildStructuredFallbackAnalysis(aggregation);
+    return {
+      structured,
+      report: structuredAnalysisToMarkdown(structured),
+      reportStatus: "Ready"
+    };
+  }
+
+  const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+
+  // AbortController with 15s timeout to prevent hanging
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+  let response;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 900,
+        temperature: 0.2,
+        system: buildClaudeSystemPrompt(),
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: buildClaudeUserPrompt(aggregation)
+              }
+            ]
+          }
+        ]
+      })
+    });
+  } catch (fetchErr) {
+    clearTimeout(timeoutId);
+    const structured = buildStructuredFallbackAnalysis(aggregation);
+    return {
+      structured,
+      report: structuredAnalysisToMarkdown(structured),
+      reportStatus: "API error",
+      reportError: fetchErr.name === "AbortError" ? "Claude API request timed out" : fetchErr.message
+    };
+  }
+  clearTimeout(timeoutId);
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    let message = body || `Claude request failed with HTTP ${response.status}`;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed?.error?.message) {
+        message = parsed.error.message;
+      }
+    } catch {
+      // Keep the raw response excerpt.
+    }
+    const structured = buildStructuredFallbackAnalysis(aggregation);
+    return {
+      structured,
+      report: `${structuredAnalysisToMarkdown(structured)}\n\n### Claude Error\n${message}`,
+      reportStatus: "API error",
+      reportError: message,
+      reportErrorBody: body,
+      reportErrorStatus: response.status
+    };
+  }
+
+  const payload = await response.json();
+  const structured = parseClaudeAnalysisJson(extractClaudeText(payload)) || buildStructuredFallbackAnalysis(aggregation);
+  return {
+    structured,
+    report: structuredAnalysisToMarkdown(structured) || extractClaudeText(payload) || buildLocalAnalysisSummary(aggregation),
+    reportStatus: "Ready"
+  };
+}
+
+function parseVoxelSpacingFromPath(zarrPath) {
+  const match = zarrPath.match(/VoxelSpacing([0-9.]+)/i);
+  const parsed = match ? Number.parseFloat(match[1]) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+async function readLevelZeroSpacing(zarrPath) {
+  const attrs = await readJson(path.join(zarrPath, ".zattrs")).catch(() => null);
+  const datasets = attrs?.multiscales?.[0]?.datasets || [];
+  const levelZero = datasets.find((dataset) => dataset.path === "0") || datasets[0];
+  const scale = levelZero?.coordinateTransformations?.find((item) => item.type === "scale")?.scale;
+  if (Array.isArray(scale) && scale.length >= 3 && scale.every((value) => Number.isFinite(Number(value)) && Number(value) > 0)) {
+    return { z: Number(scale[0]), y: Number(scale[1]), x: Number(scale[2]) };
+  }
+
+  const fallback = parseVoxelSpacingFromPath(zarrPath) || 1;
+  return { z: fallback, y: fallback, x: fallback };
+}
+
+function findPicksPathForZarr(zarrPath) {
+  const parts = zarrPath.split(path.sep);
+  const staticIndex = parts.lastIndexOf("static");
+  const experimentIndex = parts.lastIndexOf("ExperimentRuns");
+  if (staticIndex === -1 || experimentIndex === -1 || experimentIndex + 1 >= parts.length) {
+    return null;
+  }
+
+  const runName = parts[experimentIndex + 1];
+  const root = parts.slice(0, staticIndex).join(path.sep) || path.sep;
+  const picksPath = path.join(root, "overlay", "ExperimentRuns", runName, "Picks");
+  return fs.existsSync(picksPath) ? picksPath : null;
+}
+
+async function loadPickDetections(zarrPath, levelZeroShape) {
+  const picksPath = findPicksPathForZarr(zarrPath);
+  if (!picksPath) {
+    return [];
+  }
+
+  const cacheKey = `${picksPath}:${levelZeroShape.x}x${levelZeroShape.y}x${levelZeroShape.z}`;
+  if (pickCache.has(cacheKey)) {
+    return pickCache.get(cacheKey);
+  }
+
+  const entries = await fsp.readdir(picksPath, { withFileTypes: true }).catch(() => []);
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => path.join(picksPath, entry.name))
+    .sort();
+  const detections = await buildPickDetectionsFromFiles(zarrPath, levelZeroShape, files, path.basename(path.dirname(path.dirname(picksPath))));
+
+  pickCache.set(cacheKey, detections);
+  return detections;
+}
+
+async function buildPickDetectionsFromFiles(zarrPath, levelZeroShape, files, volumeLabel = "uploaded labels") {
+  const spacing = await readLevelZeroSpacing(zarrPath);
+  const detections = [];
+
+  for (const [fileIndex, filePath] of files.entries()) {
+    const payload = await readJson(filePath).catch(() => null);
+    const points = Array.isArray(payload?.points) ? payload.points : [];
+    const type = payload?.pickable_object_name || path.basename(filePath, ".json");
+    const label = formatMoleculeName(type);
+    const color = pickColor(type, fileIndex);
+    const radiusAngstrom = pickRadiusAngstrom(type);
+    const radiusVoxel = radiusAngstrom / ((spacing.x + spacing.y + spacing.z) / 3);
+
+    points.forEach((point, pointIndex) => {
+      const location = point.location || {};
+      const voxel = {
+        x: Number(location.x) / spacing.x,
+        y: Number(location.y) / spacing.y,
+        z: Number(location.z) / spacing.z
+      };
+
+      if (!Number.isFinite(voxel.x) || !Number.isFinite(voxel.y) || !Number.isFinite(voxel.z)) {
+        return;
+      }
+
+      const clipped = {
+        x: Math.max(0, Math.min(levelZeroShape.x - 1, voxel.x)),
+        y: Math.max(0, Math.min(levelZeroShape.y - 1, voxel.y)),
+        z: Math.max(0, Math.min(levelZeroShape.z - 1, voxel.z))
+      };
+
+      detections.push({
+        id: `${type}-${String(pointIndex + 1).padStart(3, "0")}`,
+        type: label,
+        molecule: type,
+        confidence: "curated pick",
+        volume: payload?.run_name || volumeLabel,
+        color,
+        radiusAngstrom,
+        radiusVoxel,
+        coords: [
+          (clipped.x / Math.max(1, levelZeroShape.x - 1)) - 0.5,
+          (clipped.y / Math.max(1, levelZeroShape.y - 1)) - 0.5,
+          (clipped.z / Math.max(1, levelZeroShape.z - 1)) - 0.5
+        ],
+        voxel: {
+          x: clipped.x,
+          y: clipped.y,
+          z: clipped.z
+        },
+        physical: {
+          x: Number(location.x),
+          y: Number(location.y),
+          z: Number(location.z),
+          unit: payload?.unit || "angstrom"
+        },
+        position: `X ${Math.round(clipped.x)}, Y ${Math.round(clipped.y)}, Z ${Math.round(clipped.z)}`,
+        notes: `${label} curated overlay pick from ${path.basename(filePath)}. Physical position ${Math.round(Number(location.x))}, ${Math.round(Number(location.y))}, ${Math.round(Number(location.z))} ${payload?.unit || "angstrom"}.`
+      });
+    });
+  }
+
+  return detections;
+}
+
+function scanPayload(id, name, scanPath, levels) {
+  return {
+    id,
+    name,
+    path: id,
+    levels,
+    defaultLevel: levels[0] || "0",
+    metadataMissing: levels.length === 0
+  };
 }
 
 async function findZarrs(rootDir, baseLabel) {
@@ -94,11 +900,7 @@ async function findZarrs(rootDir, baseLabel) {
 
     if (dir.endsWith(".zarr") || hasZgroup || hasZarrJson) {
       const relativePath = path.relative(__dirname, dir);
-      results.push({
-        id: relativePath,
-        name: `${baseLabel}: ${path.basename(dir)}`,
-        path: relativePath
-      });
+      results.push(scanPayload(relativePath, `${baseLabel}: ${path.basename(dir)}`, dir, await listZarrLevels(dir)));
       return;
     }
 
@@ -224,12 +1026,34 @@ async function decodeBloscChunk(chunkPath) {
 }
 
 async function loadVolumePreview(zarrPath, levelName = "2") {
-  const cacheKey = `${zarrPath}:${levelName}`;
+  let resolvedLevel = levelName;
+  if (!fs.existsSync(path.join(zarrPath, resolvedLevel, ".zarray"))) {
+    const levels = await listZarrLevels(zarrPath);
+    if (levels.length === 0) {
+      throw new Error(`No Zarr array metadata found in ${path.basename(zarrPath)}. The folder must include hidden metadata files such as .zarray/.zattrs or zarr.json; browser folder upload may omit these dotfiles. Use "Open local .zarr path" instead.`);
+    }
+    resolvedLevel = levels.includes(levelName) ? levelName : levels[0];
+  }
+
+  const cacheKey = `${zarrPath}:${resolvedLevel}`;
   if (volumeCache.has(cacheKey)) {
     return volumeCache.get(cacheKey);
   }
+  if (volumeLoadCache.has(cacheKey)) {
+    return volumeLoadCache.get(cacheKey);
+  }
 
-  const arrayPath = path.join(zarrPath, levelName);
+  const loadPromise = loadVolumeData(zarrPath, resolvedLevel, cacheKey);
+  volumeLoadCache.set(cacheKey, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    volumeLoadCache.delete(cacheKey);
+  }
+}
+
+async function loadVolumeData(zarrPath, resolvedLevel, cacheKey) {
+  const arrayPath = path.join(zarrPath, resolvedLevel);
   const metadata = await readJson(path.join(arrayPath, ".zarray"));
   const [depth, height, width] = metadata.shape;
   const [chunkDepth, chunkHeight, chunkWidth] = metadata.chunks;
@@ -260,6 +1084,7 @@ async function loadVolumePreview(zarrPath, levelName = "2") {
   }
 
   const volume = {
+    level: resolvedLevel,
     metadata,
     data: new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4),
     shape: { z: depth, y: height, x: width }
@@ -309,42 +1134,279 @@ function buildPointCloud(volume, requestedStride = 2, requestedLimit = 38000) {
       Number(((point.x / Math.max(1, shape.x - 1)) - 0.5).toFixed(5)),
       Number(((point.y / Math.max(1, shape.y - 1)) - 0.5).toFixed(5)),
       Number(((point.z / Math.max(1, shape.z - 1)) - 0.5).toFixed(5)),
-      Number((point.score / scoreMax).toFixed(5))
+      Number((point.score / scoreMax).toFixed(5)),
+      Number(Math.max(0, Math.min(1, (point.value - low) / spread)).toFixed(5))
     ])
   };
 }
 
-function buildDetections(volume) {
-  const { shape } = volume;
-  return [
-    {
-      id: "M01",
-      type: "candidate ribosome",
-      confidence: "sample label",
-      volume: "preview marker",
-      position: `X ${Math.round(shape.x * 0.36)}, Y ${Math.round(shape.y * 0.46)}, Z ${Math.round(shape.z * 0.42)}`,
-      coords: [-0.14, -0.04, -0.08],
-      notes: "Placeholder detection. This is where AI model output can be attached."
-    },
-    {
-      id: "M02",
-      type: "candidate membrane complex",
-      confidence: "sample label",
-      volume: "preview marker",
-      position: `X ${Math.round(shape.x * 0.62)}, Y ${Math.round(shape.y * 0.54)}, Z ${Math.round(shape.z * 0.58)}`,
-      coords: [0.12, 0.04, 0.08],
-      notes: "Clicking this marker uses the same selection path future detections will use."
-    },
-    {
-      id: "M03",
-      type: "candidate vesicle",
-      confidence: "sample label",
-      volume: "preview marker",
-      position: `X ${Math.round(shape.x * 0.52)}, Y ${Math.round(shape.y * 0.31)}, Z ${Math.round(shape.z * 0.64)}`,
-      coords: [0.02, -0.19, 0.14],
-      notes: "The current marker positions are illustrative until model detections are available."
+function buildNrrdVolume(volume) {
+  const { data, shape } = volume;
+  const values = [];
+
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    if (Number.isFinite(value) && Math.abs(value) <= 1_000_000) {
+      values.push(value);
     }
-  ];
+  }
+
+  values.sort((a, b) => a - b);
+  const low = values[Math.floor(values.length * 0.01)] || 0;
+  const high = values[Math.floor(values.length * 0.99)] || 1;
+  const range = high - low || 1;
+  const voxels = Buffer.alloc(shape.x * shape.y * shape.z);
+
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    const safeValue = Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : low;
+    voxels[index] = Math.max(0, Math.min(255, Math.round(((safeValue - low) / range) * 255)));
+  }
+
+  const header = [
+    "NRRD0005",
+    "# QBI export for 3D Slicer",
+    "type: uchar",
+    "dimension: 3",
+    "space: left-posterior-superior",
+    `sizes: ${shape.x} ${shape.y} ${shape.z}`,
+    "space directions: (1,0,0) (0,1,0) (0,0,1)",
+    "kinds: domain domain domain",
+    "encoding: raw",
+    "endian: little",
+    "space origin: (0,0,0)",
+    "",
+    ""
+  ].join("\n");
+
+  return Buffer.concat([Buffer.from(header, "ascii"), voxels]);
+}
+
+function slicerExportName(scanPath, level) {
+  const scanName = safeSegment(path.basename(scanPath || "scan").replace(/\.zarr$/i, ""));
+  return `${scanName}-level-${safeSegment(level)}.nrrd`;
+}
+
+async function writeSlicerExport(zarrPath, level) {
+  const volume = await loadVolumePreview(zarrPath, level);
+  const filename = slicerExportName(zarrPath, level);
+  const body = buildNrrdVolume(volume);
+  await fsp.mkdir(slicerExportDir, { recursive: true });
+  const filePath = path.join(slicerExportDir, filename);
+  await fsp.writeFile(filePath, body);
+  return { body, filename, filePath };
+}
+
+async function findSlicerExecutable() {
+  if (process.env.SLICER_PATH && fs.existsSync(process.env.SLICER_PATH)) {
+    return process.env.SLICER_PATH;
+  }
+
+  if (process.platform === "darwin") {
+    const roots = ["/Applications", path.join(os.homedir(), "Applications")];
+    for (const root of roots) {
+      let entries = [];
+      try {
+        entries = await fsp.readdir(root);
+      } catch {
+        continue;
+      }
+
+      const appName = entries.find((entry) => /^Slicer.*\.app$/i.test(entry));
+      if (appName) {
+        const executable = path.join(root, appName, "Contents", "MacOS", "Slicer");
+        if (fs.existsSync(executable)) {
+          return executable;
+        }
+      }
+    }
+  }
+
+  const candidates = process.platform === "win32"
+    ? [
+        "C:\\Program Files\\Slicer 5.12.0\\Slicer.exe",
+        "C:\\Program Files\\Slicer\\Slicer.exe"
+      ]
+    : [
+        "/usr/local/bin/Slicer",
+        "/usr/bin/Slicer",
+        "/opt/Slicer/Slicer"
+      ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+async function openInSlicer(filePath) {
+  const slicerExecutable = await findSlicerExecutable();
+  if (!slicerExecutable) {
+    return false;
+  }
+
+  const child = spawn(slicerExecutable, [filePath], {
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+  return true;
+}
+
+function renderPythonZarrSlice(zarrPath, level, axis, requestedIndex, maxSize) {
+  const script = `
+import json
+import sys
+
+import numpy as np
+import zarr
+
+store_path, level, axis, requested_index, requested_max_size = sys.argv[1:6]
+requested_index = int(requested_index)
+requested_max_size = int(requested_max_size)
+
+root = zarr.open(store_path, mode="r")
+volume = root if hasattr(root, "shape") else root[level]
+z_count, y_count, x_count = volume.shape
+shape = {"z": z_count, "y": y_count, "x": x_count}
+axis_size = shape[axis]
+slice_index = max(0, min(axis_size - 1, requested_index))
+
+if axis == "x":
+    image = np.asarray(volume[:, :, slice_index])
+elif axis == "y":
+    image = np.asarray(volume[:, slice_index, :])
+else:
+    image = np.asarray(volume[slice_index, :, :])
+
+source_height, source_width = image.shape
+max_size = max(64, min(1024, requested_max_size or max(source_width, source_height)))
+scale = min(1.0, max_size / max(source_width, source_height))
+width = max(1, int(round(source_width * scale)))
+height = max(1, int(round(source_height * scale)))
+
+if width != source_width or height != source_height:
+    y_indices = np.linspace(0, source_height - 1, height).astype(np.int64)
+    x_indices = np.linspace(0, source_width - 1, width).astype(np.int64)
+    image = image[np.ix_(y_indices, x_indices)]
+
+finite = np.isfinite(image) & (np.abs(image) <= 1_000_000)
+if np.any(finite):
+    low, high = np.percentile(image[finite], [1, 99])
+else:
+    low, high = 0.0, 1.0
+if not np.isfinite(high - low) or high == low:
+    high = low + 1.0
+
+safe = np.where(finite, image, low)
+pixels = np.clip(np.rint(((safe - low) / (high - low)) * 255), 0, 255).astype(np.uint8)
+meta = {
+    "axis": axis,
+    "level": level,
+    "index": slice_index,
+    "width": int(width),
+    "height": int(height),
+    "sourceWidth": int(source_width),
+    "sourceHeight": int(source_height),
+    "depth": int(axis_size),
+    "low": float(low),
+    "high": float(high),
+}
+sys.stderr.write("__QBI_META__" + json.dumps(meta) + "\\n")
+sys.stdout.buffer.write(pixels.tobytes(order="C"))
+`;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", [
+      "-c",
+      script,
+      zarrPath,
+      level,
+      axis,
+      String(requestedIndex),
+      String(maxSize)
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        MPLCONFIGDIR: path.join(os.tmpdir(), "qbi-matplotlib")
+      }
+    });
+
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const errorText = Buffer.concat(stderr).toString("utf8");
+      if (code !== 0) {
+        reject(new Error(errorText || `Python slice renderer exited with code ${code}`));
+        return;
+      }
+
+      const metaLine = errorText.split(/\r?\n/).find((line) => line.startsWith("__QBI_META__"));
+      if (!metaLine) {
+        reject(new Error("Python slice renderer did not return metadata"));
+        return;
+      }
+
+      resolve({
+        meta: JSON.parse(metaLine.replace("__QBI_META__", "")),
+        pixels: Buffer.concat(stdout)
+      });
+    });
+  });
+}
+
+function sliceCacheKey(zarrPath, level, axis, index, maxSize) {
+  return `${zarrPath}:${level}:${axis}:${index}:${maxSize}`;
+}
+
+function getCachedSlice(key) {
+  const cached = sliceCache.get(key);
+  if (!cached) {
+    return null;
+  }
+  sliceCache.delete(key);
+  sliceCache.set(key, cached);
+  return cached;
+}
+
+function setCachedSlice(key, value) {
+  if (sliceCache.has(key)) {
+    sliceCacheBytes -= sliceCache.get(key).pixels.length;
+    sliceCache.delete(key);
+  }
+
+  sliceCache.set(key, value);
+  sliceCacheBytes += value.pixels.length;
+
+  while (sliceCacheBytes > maxSliceCacheBytes && sliceCache.size > 0) {
+    const oldestKey = sliceCache.keys().next().value;
+    const oldest = sliceCache.get(oldestKey);
+    sliceCacheBytes -= oldest.pixels.length;
+    sliceCache.delete(oldestKey);
+  }
+}
+
+async function loadCachedPythonZarrSlice(zarrPath, level, axis, index, maxSize) {
+  const key = sliceCacheKey(zarrPath, level, axis, index, maxSize);
+  const cached = getCachedSlice(key);
+  if (cached) {
+    return cached;
+  }
+  if (sliceLoadCache.has(key)) {
+    return sliceLoadCache.get(key);
+  }
+
+  const promise = renderPythonZarrSlice(zarrPath, level, axis, index, maxSize)
+    .then((result) => {
+      setCachedSlice(key, result);
+      return result;
+    })
+    .finally(() => {
+      sliceLoadCache.delete(key);
+    });
+  sliceLoadCache.set(key, promise);
+  return promise;
 }
 
 async function handleApi(req, res) {
@@ -355,7 +1417,31 @@ async function handleApi(req, res) {
       findZarrs(sampleDir, "Sample"),
       findZarrs(uploadsDir, "Uploaded")
     ]);
-    sendJson(res, 200, { scans: [...sampleScans, ...uploadedScans] });
+    const localScanList = await Promise.all(
+      [...localScans.entries()].map(async ([id, scanPath]) => scanPayload(id, `Local: ${path.basename(scanPath)}`, scanPath, await listZarrLevels(scanPath)))
+    );
+    sendJson(res, 200, { scans: [...sampleScans, ...uploadedScans, ...localScanList] });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/local-zarr") {
+    const body = await readRequestJson(req);
+    const requestedPath = path.resolve(String(body.path || ""));
+    const stats = await fsp.stat(requestedPath).catch(() => null);
+    if (!stats?.isDirectory()) {
+      sendJson(res, 400, { error: "Local path must point to an existing .zarr directory" });
+      return;
+    }
+
+    const levels = await listZarrLevels(requestedPath);
+    if (levels.length === 0) {
+      sendJson(res, 400, { error: "No .zarray metadata files were found in that .zarr directory" });
+      return;
+    }
+
+    const id = `local:${Buffer.from(requestedPath).toString("base64url")}`;
+    localScans.set(id, requestedPath);
+    sendJson(res, 200, { scan: scanPayload(id, `Local: ${path.basename(requestedPath)}`, requestedPath, levels) });
     return;
   }
 
@@ -387,12 +1473,27 @@ async function handleApi(req, res) {
 
     const level = url.searchParams.get("level") || "2";
     const stride = Number.parseInt(url.searchParams.get("stride") || "2", 10);
-    const limit = Number.parseInt(url.searchParams.get("limit") || "38000", 10);
-    const volume = await loadVolumePreview(zarrPath, level);
+    const levels = await listZarrLevels(zarrPath);
+    const levelShapes = await readZarrLevelShapes(zarrPath);
+    const resolvedLevel = levelShapes[level] ? level : levels[0];
+    const shape = levelShapes[resolvedLevel];
+    if (!shape) {
+      sendJson(res, 400, { error: `No Zarr array metadata found in ${path.basename(zarrPath)}` });
+      return;
+    }
+    const levelZeroShape = levelShapes["0"] || shape;
+    const pickDetections = await loadPickDetections(zarrPath, levelZeroShape);
+    const spacing = await readLevelZeroSpacing(zarrPath);
+    const aggregation = buildMoleculeAggregation(pickDetections, 0, buildVolumeMetadata(levelZeroShape, spacing));
+
     sendJson(res, 200, {
-      level,
-      ...buildPointCloud(volume, stride, limit),
-      detections: buildDetections(volume)
+      level: resolvedLevel,
+      levels,
+      levelShapes,
+      shape,
+      stats: { min: 0, max: 0, points: 0, stride },
+      points: [],
+      detections: pickDetections
     });
     return;
   }
@@ -404,35 +1505,139 @@ async function handleApi(req, res) {
       return;
     }
 
+    const axis = ["x", "y", "z"].includes(url.searchParams.get("axis")) ? url.searchParams.get("axis") : "z";
     const level = url.searchParams.get("level") || "2";
-    const volume = await loadVolumePreview(zarrPath, level);
-    const z = Math.max(0, Math.min(volume.shape.z - 1, Number.parseInt(url.searchParams.get("z") || `${Math.floor(volume.shape.z / 2)}`, 10)));
-    const pixels = Buffer.alloc(volume.shape.x * volume.shape.y);
-    const values = [];
+    const sourceLevel = url.searchParams.get("sourceLevel") || level;
+    const sourceIndex = Number.parseInt(url.searchParams.get("index") || url.searchParams.get(axis) || url.searchParams.get("z") || "0", 10);
+    const maxSize = Math.max(64, Math.min(1024, Number.parseInt(url.searchParams.get("maxSize") || "0", 10) || 1024));
+    let sourceShape = null;
 
-    for (let y = 0; y < volume.shape.y; y += 1) {
-      for (let x = 0; x < volume.shape.x; x += 1) {
-        const value = volume.data[z * volume.shape.y * volume.shape.x + y * volume.shape.x + x];
-        if (Number.isFinite(value) && Math.abs(value) <= 1_000_000) {
-          values.push(value);
+    if (sourceLevel !== level) {
+      sourceShape = (await readZarrLevelShapes(zarrPath))[sourceLevel] || null;
+    }
+
+    const levelShapes = await readZarrLevelShapes(zarrPath);
+    const shape = levelShapes[level];
+    if (!shape) {
+      sendJson(res, 400, { error: `Zarr level ${level} was not found` });
+      return;
+    }
+
+    const axisSize = shape[axis];
+    const sourceAxisSize = sourceShape?.[axis] || axisSize;
+    const mappedIndex = sourceShape
+      ? Math.round((Math.max(0, Math.min(sourceAxisSize - 1, sourceIndex)) / Math.max(1, sourceAxisSize - 1)) * (axisSize - 1))
+      : sourceIndex;
+    const sliceIndex = Math.max(0, Math.min(axisSize - 1, Number.isFinite(mappedIndex) ? mappedIndex : Math.floor(axisSize / 2)));
+    const { meta, pixels } = await loadCachedPythonZarrSlice(zarrPath, level, axis, sliceIndex, maxSize);
+
+    sendBuffer(res, 200, pixels, "application/octet-stream", {
+      "X-QBI-Slice-Axis": axis,
+      "X-QBI-Slice-Level": meta.level,
+      "X-QBI-Slice-Index": String(meta.index),
+      "X-QBI-Slice-Z": String(meta.index),
+      "X-QBI-Slice-Width": String(meta.width),
+      "X-QBI-Slice-Height": String(meta.height),
+      "X-QBI-Slice-Source-Width": String(meta.sourceWidth),
+      "X-QBI-Slice-Source-Height": String(meta.sourceHeight),
+      "X-QBI-Slice-Depth": String(meta.depth),
+      "X-QBI-Slice-Low": String(meta.low),
+      "X-QBI-Slice-High": String(meta.high)
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/slicer/export") {
+    const zarrPath = resolveScanPath(url.searchParams.get("path"));
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "Invalid scan path" });
+      return;
+    }
+
+    const level = url.searchParams.get("level") || "2";
+    const { body, filename } = await writeSlicerExport(zarrPath, level);
+    sendDownload(res, body, filename, "application/octet-stream");
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/slicer/open") {
+    const zarrPath = resolveScanPath(url.searchParams.get("path"));
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "Invalid scan path" });
+      return;
+    }
+
+    const level = url.searchParams.get("level") || "2";
+    const { filename, filePath } = await writeSlicerExport(zarrPath, level);
+    const opened = await openInSlicer(filePath);
+    const exportUrl = `/api/slicer/export?path=${encodeURIComponent(path.relative(__dirname, zarrPath))}&level=${encodeURIComponent(level)}`;
+
+    sendJson(res, 200, {
+      opened,
+      filename,
+      filePath,
+      exportUrl,
+      downloadUrl: "https://download.slicer.org/"
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/upload-picks") {
+    const zarrPath = resolveScanPath(url.searchParams.get("path"));
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "Select a valid Zarr scan before uploading labels" });
+      return;
+    }
+
+    const uploadId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const targetRoot = path.join(labelUploadsDir, uploadId);
+    const upload = await readMultipartFolder(req, targetRoot, 50_000_000);
+    if (upload.error) {
+      sendJson(res, 400, { error: upload.error });
+      return;
+    }
+
+    const jsonFiles = [];
+    async function collectJsonFiles(dir) {
+      const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await collectJsonFiles(entryPath);
+        } else if (entry.isFile() && entry.name.endsWith(".json")) {
+          jsonFiles.push(entryPath);
         }
       }
     }
+    await collectJsonFiles(targetRoot);
+    jsonFiles.sort();
 
-    values.sort((a, b) => a - b);
-    const min = values[Math.floor(values.length * 0.01)] || 0;
-    const max = values[Math.floor(values.length * 0.99)] || 1;
-    const range = max - min || 1;
-
-    for (let y = 0; y < volume.shape.y; y += 1) {
-      for (let x = 0; x < volume.shape.x; x += 1) {
-        const value = volume.data[z * volume.shape.y * volume.shape.x + y * volume.shape.x + x];
-        const safeValue = Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : min;
-        pixels[y * volume.shape.x + x] = Math.max(0, Math.min(255, Math.round(((safeValue - min) / range) * 255)));
-      }
+    if (jsonFiles.length === 0) {
+      sendJson(res, 400, { error: "No pick JSON files were found in the uploaded labels folder" });
+      return;
     }
 
-    sendBuffer(res, 200, pixels, "application/octet-stream");
+    const levelShapes = await readZarrLevelShapes(zarrPath);
+    const levelZeroShape = levelShapes["0"] || Object.values(levelShapes)[0];
+    if (!levelZeroShape) {
+      sendJson(res, 400, { error: "Could not read the selected Zarr shape for label scaling" });
+      return;
+    }
+    const spacing = await readLevelZeroSpacing(zarrPath);
+    const volume = buildVolumeMetadata(levelZeroShape, spacing);
+
+    const detections = await buildPickDetectionsFromFiles(zarrPath, levelZeroShape, jsonFiles, "uploaded labels");
+    const aggregation = buildMoleculeAggregation(detections, jsonFiles.length, volume);
+    const aiAnalysis = await generateClaudeAnalysis(aggregation);
+    sendJson(res, 200, {
+      files: upload.files,
+      jsonFiles: jsonFiles.length,
+      detections,
+      analysis: {
+        aggregation,
+        ...aiAnalysis
+      }
+    });
     return;
   }
 
@@ -489,7 +1694,15 @@ async function handleApi(req, res) {
         }
 
         const scans = await findZarrs(targetRoot, "Uploaded");
-        sendJson(res, 200, { files, scans });
+        const validScans = scans.filter((scan) => scan.levels.length > 0);
+        if (scans.length > 0 && validScans.length === 0) {
+          sendJson(res, 400, {
+            error: "The uploaded .zarr folder is missing .zarray metadata files. Browser folder upload often skips hidden dotfiles; use the Local .zarr path field with the original folder instead."
+          });
+          return;
+        }
+
+        sendJson(res, 200, { files, scans: validScans });
       } catch (error) {
         sendJson(res, 500, { error: error.message });
       }
@@ -497,7 +1710,370 @@ async function handleApi(req, res) {
     return;
   }
 
+  // ─── Inference endpoints ──────────────────────────────────────────────
+
+  if (req.method === "GET" && url.pathname === "/api/inference/progress") {
+    const scanId = url.searchParams.get("scanId");
+    if (!scanId) {
+      sendJson(res, 400, { error: "scanId required" });
+      return;
+    }
+
+    // SSE: Server-Sent Events for progress streaming
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*"
+    });
+
+    const emitter = inferenceEmitters.get(scanId) || new EventEmitter();
+    inferenceEmitters.set(scanId, emitter);
+
+    const onProgress = (data) => {
+      res.write(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    const onComplete = (data) => {
+      res.write(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
+      res.end();
+      cleanup();
+      clearInterval(keepAlive);
+    };
+    const onError = (err) => {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
+      res.end();
+      cleanup();
+      clearInterval(keepAlive);
+    };
+
+    const cleanup = () => {
+      emitter.removeListener("progress", onProgress);
+      emitter.removeListener("complete", onComplete);
+      emitter.removeListener("error", onError);
+      inferenceEmitters.delete(scanId);
+    };
+
+    emitter.on("progress", onProgress);
+    emitter.on("complete", onComplete);
+    emitter.on("error", onError);
+
+    // Keep-alive
+    const keepAlive = setInterval(() => {
+      res.write(": keepalive\n\n");
+    }, 15000);
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      cleanup();
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/inference/run") {
+    const body = await readRequestJson(req);
+    const zarrPath = body.zarrPath;
+    const scanId = body.scanId || `infer-${Date.now()}`;
+
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "zarrPath is required" });
+      return;
+    }
+
+    // Resolve the actual filesystem path
+    let resolvedPath = null;
+    if (zarrPath.startsWith("local:")) {
+      resolvedPath = localScans.get(zarrPath);
+    } else {
+      resolvedPath = resolveScanPath(zarrPath);
+    }
+    if (!resolvedPath) {
+      // Try as a direct path
+      resolvedPath = path.resolve(zarrPath);
+      if (!fs.existsSync(resolvedPath)) {
+        sendJson(res, 400, { error: `Zarr path not found: ${zarrPath}` });
+        return;
+      }
+    }
+
+    // Create emitter if not already present
+    if (!inferenceEmitters.has(scanId)) {
+      inferenceEmitters.set(scanId, new EventEmitter());
+    }
+    const emitter = inferenceEmitters.get(scanId);
+
+    // Respond immediately that inference has started
+    sendJson(res, 200, { scanId, status: "started", message: "Inference started" });
+
+    // Run inference asynchronously
+    runInferenceProcess(resolvedPath, scanId, emitter).catch((err) => {
+      emitter.emit("error", { message: err.message || String(err) });
+    });
+    return;
+  }
+
   sendJson(res, 404, { error: "API route not found" });
+}
+
+// ─── Inference runner ──────────────────────────────────────────────────
+
+const projectRoot = path.resolve(__dirname, "..");
+const inferenceScript = path.join(projectRoot, "backend", "inference", "run_inference_direct.py");
+const hardcodedCheckpoint = path.resolve(os.homedir(), "Downloads", "czii-weights", "weight_best.ckpt");
+
+async function runInferenceProcess(zarrPath, scanId, emitter) {
+  const checkpoint = hardcodedCheckpoint;
+  if (!fs.existsSync(checkpoint)) {
+    emitter.emit("error", { message: `Checkpoint not found at ${checkpoint}. Please ensure the file exists.` });
+    return;
+  }
+
+  await fsp.mkdir(predictionsDir, { recursive: true });
+  const outputPath = path.join(predictionsDir, `predictions_${scanId}.json`);
+
+  // Determine device
+  let device = "cpu";
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    device = "mps";
+  } else if (process.platform !== "darwin") {
+    device = "cuda";
+  }
+
+  const env = {
+    ...process.env,
+    PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0",
+    PYTHONUNBUFFERED: "1"
+  };
+
+  const args = [
+    inferenceScript,
+    "--checkpoint", checkpoint,
+    "--zarr_path", zarrPath,
+    "--device", device,
+    "--dtype", "float32",
+    "--window_size", "64", "64", "64",
+    "--tiles_per_dim", "3", "10", "10",
+    "--output", outputPath,
+    "--iou_threshold", "0.85"
+  ];
+
+  emitter.emit("progress", { phase: "loading", percent: 0, message: "Starting inference..." });
+
+  const child = spawn("python3", args, {
+    cwd: projectRoot,
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  const stderrChunks = [];
+
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString("utf8");
+    stderrChunks.push(text);
+
+    // Parse progress lines — format: __QBI_PROGRESS__:<percent>:<batch>/<total>:<bar>
+    const progressMatch = text.match(/__QBI_PROGRESS__:([0-9.]+)(?::(\d+)\/(\d+):([█░]+))?/);
+    if (progressMatch) {
+      const percent = Number.parseFloat(progressMatch[1]);
+      const phase = percent < 0.1 ? "loading" : percent < 0.85 ? "inference" : "decoding";
+      const messages = {
+        loading: "Loading model and volume...",
+        inference: "Running model inference on tiles...",
+        decoding: "Decoding detections..."
+      };
+
+      const progressData = {
+        phase,
+        percent: Math.round(percent * 100),
+        message: messages[phase] || "Processing..."
+      };
+
+      // Add tqdm-style bar info if available
+      if (progressMatch[2] && progressMatch[3]) {
+        const batch = Number.parseInt(progressMatch[2], 10);
+        const total = Number.parseInt(progressMatch[3], 10);
+        const bar = progressMatch[4] || "";
+        progressData.batch = batch;
+        progressData.total = total;
+        progressData.bar = bar;
+        progressData.message = `Tile ${batch} / ${total}  ${bar}`;
+      }
+
+      emitter.emit("progress", progressData);
+    }
+
+    // Also emit log lines for the UI
+    const logMatch = text.match(/^(Loading|Running|Found|Saved|Volume|Output)/m);
+    if (logMatch) {
+      emitter.emit("progress", {
+        phase: "inference",
+        percent: -1,
+        message: text.trim()
+      });
+    }
+  });
+
+  child.on("error", (err) => {
+    emitter.emit("error", { message: `Failed to start inference: ${err.message}` });
+  });
+
+  child.on("close", async (code) => {
+    if (code !== 0) {
+      const stderr = stderrChunks.join("");
+      const errorMsg = stderr.split("\n").filter((l) => l && !l.startsWith("__QBI_")).slice(-5).join("; ");
+      emitter.emit("error", { message: `Inference failed (exit ${code}): ${errorMsg || "Unknown error"}` });
+      return;
+    }
+
+    // Read the predictions file
+    try {
+      const predictionsRaw = await fsp.readFile(outputPath, "utf8");
+      const predictions = JSON.parse(predictionsRaw);
+
+      // Convert predictions to pick-style detections
+      const levelShapes = await readZarrLevelShapes(zarrPath);
+      let levelZeroShape = levelShapes["0"] || Object.values(levelShapes)[0];
+      if (!levelZeroShape) {
+        // Fallback: use a default shape based on the predictions
+        const maxVoxel = { x: 0, y: 0, z: 0 };
+        for (const det of (predictions.detections || [])) {
+          maxVoxel.x = Math.max(maxVoxel.x, Math.ceil(det.x_pixel || 0));
+          maxVoxel.y = Math.max(maxVoxel.y, Math.ceil(det.y_pixel || 0));
+          maxVoxel.z = Math.max(maxVoxel.z, Math.ceil(det.z_pixel || 0));
+        }
+        levelZeroShape = { x: Math.max(1, maxVoxel.x + 100), y: Math.max(1, maxVoxel.y + 100), z: Math.max(1, maxVoxel.z + 100) };
+      }
+      const spacing = await readLevelZeroSpacing(zarrPath).catch(() => ({ x: 10, y: 10, z: 10 }));
+
+      // Build pick files from predictions
+      const pickFiles = await buildPickFilesFromPredictions(predictions, zarrPath, levelZeroShape, spacing, scanId);
+
+      // Load the detections into the format the frontend expects
+      const detections = [];
+      for (const [fileIndex, pickFile] of pickFiles.entries()) {
+        const payload = await readJson(pickFile.path);
+        const points = Array.isArray(payload?.points) ? payload.points : [];
+        const type = payload?.pickable_object_name || path.basename(pickFile.path, ".json");
+        const label = formatMoleculeName(type);
+        const color = pickColor(type, fileIndex);
+        const radiusAngstrom = pickRadiusAngstrom(type);
+        const radiusVoxel = radiusAngstrom / ((spacing.x + spacing.y + spacing.z) / 3);
+
+        points.forEach((point, pointIndex) => {
+          const location = point.location || {};
+          const voxel = {
+            x: Number(location.x) / spacing.x,
+            y: Number(location.y) / spacing.y,
+            z: Number(location.z) / spacing.z
+          };
+
+          if (!Number.isFinite(voxel.x) || !Number.isFinite(voxel.y) || !Number.isFinite(voxel.z)) {
+            return;
+          }
+
+          const clipped = {
+            x: Math.max(0, Math.min(levelZeroShape.x - 1, voxel.x)),
+            y: Math.max(0, Math.min(levelZeroShape.y - 1, voxel.y)),
+            z: Math.max(0, Math.min(levelZeroShape.z - 1, voxel.z))
+          };
+
+          detections.push({
+            id: `${type}-${String(pointIndex + 1).padStart(3, "0")}`,
+            type: label,
+            molecule: type,
+            confidence: `model: ${(point.score || 1.0).toFixed(3)}`,
+            volume: path.basename(zarrPath),
+            color,
+            radiusAngstrom,
+            radiusVoxel,
+            coords: [
+              (clipped.x / Math.max(1, levelZeroShape.x - 1)) - 0.5,
+              (clipped.y / Math.max(1, levelZeroShape.y - 1)) - 0.5,
+              (clipped.z / Math.max(1, levelZeroShape.z - 1)) - 0.5
+            ],
+            voxel: { x: clipped.x, y: clipped.y, z: clipped.z },
+            physical: {
+              x: Number(location.x),
+              y: Number(location.y),
+              z: Number(location.z),
+              unit: "angstrom"
+            },
+            position: `X ${Math.round(clipped.x)}, Y ${Math.round(clipped.y)}, Z ${Math.round(clipped.z)}`,
+            notes: `${label} model detection. Confidence ${(point.score || 1.0).toFixed(3)}.`
+          });
+        });
+      }
+
+      // Build analysis inline (with 15s timeout on Claude API)
+      let aiAnalysis = null;
+      try {
+        const aggregation = buildMoleculeAggregation(detections, pickFiles.length, buildVolumeMetadata(levelZeroShape, spacing));
+        aiAnalysis = await generateClaudeAnalysis(aggregation);
+      } catch {
+        // Analysis is best-effort
+      }
+
+      emitter.emit("complete", {
+        detections,
+        analysis: aiAnalysis,
+        predictionsFile: path.relative(__dirname, outputPath),
+        pickFiles: pickFiles.map((f) => path.relative(__dirname, f.path)),
+        numDetections: detections.length
+      });
+    } catch (err) {
+      emitter.emit("error", { message: `Failed to process predictions: ${err.message}` });
+    }
+  });
+}
+
+async function buildPickFilesFromPredictions(predictions, zarrPath, levelZeroShape, spacing, scanId) {
+  const detections = predictions.detections || [];
+  const studyName = path.basename(zarrPath).replace(/\.zarr$/i, "");
+
+  // Group by particle type
+  const groups = {};
+  for (const det of detections) {
+    const type = det.particle_type || "unknown";
+    if (!groups[type]) groups[type] = [];
+    groups[type].push(det);
+  }
+
+  const pickDir = path.join(predictionsDir, `picks_${scanId}`);
+  await fsp.mkdir(pickDir, { recursive: true });
+  const writtenFiles = [];
+
+  for (const [moleculeName, moleculeDets] of Object.entries(groups)) {
+    const points = moleculeDets.map((det) => ({
+      location: {
+        x: det.x_angstrom,
+        y: det.y_angstrom,
+        z: det.z_angstrom
+      },
+      transformation_: [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      instance_id: 0,
+      score: det.score || 1.0
+    }));
+
+    const pickPayload = {
+      pickable_object_name: moleculeName,
+      user_id: "model",
+      session_id: "0",
+      run_name: studyName,
+      voxel_spacing: null,
+      unit: "angstrom",
+      points,
+      trust_orientation: true
+    };
+
+    const outputPath = path.join(pickDir, `${moleculeName}.json`);
+    await fsp.writeFile(outputPath, JSON.stringify(pickPayload, null, 2));
+    writtenFiles.push({ path: outputPath, molecule: moleculeName });
+  }
+
+  return writtenFiles;
 }
 
 const server = http.createServer((req, res) => {
@@ -511,6 +2087,10 @@ const server = http.createServer((req, res) => {
   if (!["GET", "HEAD"].includes(req.method)) {
     send(res, 405, "Method Not Allowed");
     return;
+  }
+
+  if (new URL(req.url, `http://localhost:${port}`).pathname === "/test3d") {
+    req.url = "/test3d.html";
   }
 
   let filePath;

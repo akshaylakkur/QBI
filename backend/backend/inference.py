@@ -123,6 +123,8 @@ def _flush(model, patches, coords, pred, norm, window, P, p, lcrop, pcrop,
         # valid region starts at lcrop within the padded volume
         z0, y0, x0 = z - lcrop, y - lcrop, x - lcrop
         pred[:, z0:z0 + d, y0:y0 + d, x0:x0 + d] += p * win
+        # win[0] is the (d,d,d) 3D window (indexes the leading singleton dim),
+        # so this accumulates the full 3D cosine window into norm, matching pred.
         norm[z0:z0 + d, y0:y0 + d, x0:x0 + d] += win[0]
 
 

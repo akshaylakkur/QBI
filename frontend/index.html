@@ -35,17 +35,38 @@
 
           <div class="field-stack">
             <label>
+              Local .zarr path
+              <span class="inline-field">
+                <input id="local-zarr-path" type="text" placeholder="/Users/name/path/to/scan.zarr">
+                <button id="open-local-zarr" type="button">Open</button>
+              </span>
+            </label>
+            <label>
               Dataset
               <select id="scan-select"></select>
             </label>
             <label>
-              Preview scale
-              <select id="level-select">
-                <option value="2" selected>Level 2 - fastest overview</option>
-                <option value="1">Level 1 - mid detail</option>
-                <option value="0">Level 0 - full resolution</option>
-              </select>
+              Upload labels
+              <input id="labels-upload" type="file" multiple webkitdirectory directory accept=".json,application/json">
             </label>
+            <select id="level-select" hidden aria-hidden="true">
+              <option value="2" selected>Level 2 - fastest overview</option>
+              <option value="1">Level 1 - mid detail</option>
+              <option value="0">Level 0 - full resolution</option>
+            </select>
+          </div>
+
+          <div class="inference-section">
+            <button id="run-inference" type="button" class="inference-button">
+              <span class="inference-icon">▶</span>
+              Run Model Inference
+            </button>
+            <div id="inference-progress" class="inference-progress" hidden>
+              <div class="inference-progress-bar">
+                <span id="inference-progress-fill" class="inference-progress-fill"></span>
+              </div>
+              <span id="inference-status" class="inference-status-text">Starting...</span>
+            </div>
           </div>
         </section>
 
@@ -106,8 +127,21 @@
             </div>
             <div class="tool-buttons" aria-label="3D view tools">
               <button id="rotate-toggle" type="button" aria-label="Toggle rotation">R</button>
-              <button id="slice-back" type="button" aria-label="Previous slice">-</button>
-              <button id="slice-forward" type="button" aria-label="Next slice">+</button>
+              <div class="slice-slider-stack" aria-label="Orthogonal slice controls">
+                <label class="slice-slider-control" aria-label="X slice">
+                  <span id="x-slice-value">X -</span>
+                  <input id="x-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+                <label class="slice-slider-control" aria-label="Y slice">
+                  <span id="y-slice-value">Y -</span>
+                  <input id="y-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+                <label class="slice-slider-control" aria-label="Z slice">
+                  <span id="z-slice-value">Z -</span>
+                  <input id="z-slice-slider" type="range" min="0" max="0" value="0" step="1">
+                </label>
+              </div>
+              <button id="open-slicer" type="button" aria-label="Open volume in 3D Slicer">S</button>
               <button id="reload-scan" type="button" aria-label="Reload scan">L</button>
             </div>
           </div>
@@ -121,43 +155,50 @@
           <article class="panel detections-panel">
             <div class="panel-heading">
               <h2>Detected molecules</h2>
-              <span id="detection-count" class="status-pill">0 labels</span>
+              <div class="panel-heading-actions">
+                <span id="detection-count" class="status-pill">0 picks</span>
+                <button id="show-all-molecules" type="button" class="show-all-btn" hidden>Show all</button>
+              </div>
             </div>
             <div id="detection-list" class="detection-list"></div>
           </article>
 
           <article class="panel detail-panel">
             <div class="panel-heading">
-              <h2>Slice preview</h2>
-              <span id="slice-label" class="status-pill active">Z -</span>
+              <h2>Dataset analysis</h2>
+              <span id="analysis-status" class="status-pill">Waiting for labels</span>
             </div>
-            <canvas id="slice-canvas" class="slice-preview" width="158" height="158" aria-label="2D tomogram slice preview"></canvas>
-          </article>
-
-          <article class="panel info-panel">
-            <h2>Object information</h2>
-            <dl class="object-facts">
-              <div>
-                <dt>ID</dt>
-                <dd id="selected-id">-</dd>
+            <div id="analysis-summary" class="analysis-summary"></div>
+            <div id="analysis-report" class="analysis-report">
+              Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.
+            </div>
+            <div class="analysis-detail">
+              <div class="panel-heading analysis-detail-heading">
+                <h3>Selected molecule</h3>
               </div>
-              <div>
-                <dt>Type</dt>
-                <dd id="selected-type">-</dd>
-              </div>
-              <div>
-                <dt>Confidence</dt>
-                <dd id="selected-confidence">-</dd>
-              </div>
-              <div>
-                <dt>Position</dt>
-                <dd id="selected-position">-</dd>
-              </div>
-              <div>
-                <dt>Notes</dt>
-                <dd id="selected-notes">-</dd>
-              </div>
-            </dl>
+              <dl class="object-facts">
+                <div>
+                  <dt>ID</dt>
+                  <dd id="selected-id">-</dd>
+                </div>
+                <div>
+                  <dt>Type</dt>
+                  <dd id="selected-type">-</dd>
+                </div>
+                <div>
+                  <dt>Confidence</dt>
+                  <dd id="selected-confidence">-</dd>
+                </div>
+                <div>
+                  <dt>Position</dt>
+                  <dd id="selected-position">-</dd>
+                </div>
+                <div>
+                  <dt>Notes</dt>
+                  <dd id="selected-notes">-</dd>
+                </div>
+              </dl>
+            </div>
           </article>
         </section>
       </section>

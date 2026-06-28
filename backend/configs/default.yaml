@@ -60,6 +60,9 @@ loss:
   # class_weights: "inverse" | "ones" | explicit list length n_class
   class_weights: "inverse"
   ignore_index: -1
+  # Classes that carry target signal (background + 6 particles). Membrane
+  # (class 7) is excluded until membrane targets are explicitly built.
+  active_classes: [0, 1, 2, 3, 4, 5, 6]
 
 # ---- Training -----------------------------------------------------------
 train:
@@ -67,8 +70,14 @@ train:
   steps_per_epoch: 150
   batch_size: 8             # per-GPU
   steps_per_valid: 20
-  n_workers: 4
+  # n_workers=0 avoids duplicating the in-RAM tomogram pool across forked
+  # workers (which multiplies resident memory and causes OOM on Kaggle).
+  n_workers: 0
   pin_memory: true
+  # Run the (slow) full-volume validation pass every N epochs (and on the
+  # final epoch). On in-between epochs, checkpoint selection falls back to
+  # patch-level F1. 1 = every epoch.
+  vol_eval_every: 10
 
   optimizer: "adamw"
   lr: 1.0e-4
