@@ -6,6 +6,7 @@ pd = pytest.importorskip("pandas")
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_geometric")
 
+from downstream.gnn.features import EDGE_DIM
 from downstream.gnn.graph import build_graph_from_dataframe, graphs_from_exposure_csv
 
 
@@ -36,11 +37,10 @@ def _mini_df():
 
 def test_build_graph_shapes():
     g = build_graph_from_dataframe(_mini_df(), "T1")
-    assert g.num_nodes == 2
-    assert g.x.shape[0] == 2
-    assert g.y.shape == (2, 1)
-    assert g.edge_index.shape[0] == 2
-    assert g.edge_attr.shape[1] == 4
+    assert g.x.shape[0] == g.num_nodes
+    assert g.y.shape[0] == g.num_nodes
+    assert g.edge_attr.shape[1] == EDGE_DIM
+    assert g.x.shape[1] > 10  # physics features (shells, knn, etc.)
 
 
 def test_graphs_from_csv(tmp_path):

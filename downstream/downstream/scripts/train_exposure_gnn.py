@@ -1,55 +1,29 @@
-"""Train GATv2 surrogate for steric exposure.
-
-Usage:
-  python -m downstream.scripts.train_exposure_gnn \
-    --labels /Users/kjaladi/Desktop/QBI/runs/exposure_labels_2000rays.csv \
-    --out /Users/kjaladi/Desktop/QBI/runs/exposure_gnn.pt
-"""
+"""Train steric exposure GNN: synthetic pretrain + LOTO CV."""
 
 from __future__ import annotations
 
 import argparse
-import json
-from typing import Optional
 
-from downstream.gnn.train import TrainConfig, train_exposure_gnn
+from downstream.gnn.train import TrainConfig, run_pipeline
 
 
-def main(argv: Optional[list] = None) -> None:
-    ap = argparse.ArgumentParser(description="Train steric exposure GNN surrogate")
-    ap.add_argument(
-        "--labels",
-        default="/Users/kjaladi/Desktop/QBI/runs/exposure_labels_2000rays.csv",
-        help="Exposure labels CSV from compute_exposure",
-    )
-    ap.add_argument(
-        "--out",
-        default="/Users/kjaladi/Desktop/QBI/runs/exposure_gnn.pt",
-        help="Checkpoint output path",
-    )
-    ap.add_argument("--epochs", type=int, default=300)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--hidden-dim", type=int, default=64)
-    ap.add_argument("--edge-cutoff", type=float, default=500.0)
-    ap.add_argument(
-        "--val-tomo",
-        action="append",
-        default=None,
-        help="Validation tomogram id (default: TS_73_6 TS_99_9)",
-    )
-    args = ap.parse_args(argv)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--labels", default="/Users/kjaladi/Desktop/QBI/runs/exposure_labels_2000rays.csv")
+    ap.add_argument("--out", default="/Users/kjaladi/Desktop/QBI/runs/exposure_gnn.pt")
+    ap.add_argument("--synthetic-nodes", type=int, default=50_000)
+    ap.add_argument("--synthetic-rays", type=int, default=200)
+    ap.add_argument("--pretrain-epochs", type=int, default=60)
+    ap.add_argument("--finetune-epochs", type=int, default=120)
+    args = ap.parse_args()
 
-    val_tomos = tuple(args.val_tomo) if args.val_tomo else ("TS_73_6", "TS_99_9")
     config = TrainConfig(
-        epochs=args.epochs,
-        lr=args.lr,
-        hidden_dim=args.hidden_dim,
-        edge_cutoff=args.edge_cutoff,
-        val_tomo_ids=val_tomos,
+        synthetic_nodes=args.synthetic_nodes,
+        synthetic_n_rays=args.synthetic_rays,
+        pretrain_epochs=args.pretrain_epochs,
+        finetune_epochs=args.finetune_epochs,
     )
-
-    metrics = train_exposure_gnn(args.labels, args.out, config=config)
-    print(json.dumps(metrics, indent=2))
+    run_pipeline(args.labels, args.out, config)
 
 
 if __name__ == "__main__":
