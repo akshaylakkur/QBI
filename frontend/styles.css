@@ -131,39 +131,6 @@ h2 {
   font-weight: 600;
 }
 
-.header-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.primary-action,
-.icon-button {
-  min-height: 40px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--ink);
-  font-weight: 600;
-  box-shadow: var(--shadow-soft);
-}
-
-.primary-action {
-  padding: 0 16px;
-  border-color: var(--blue);
-  background: var(--blue);
-  color: #ffffff;
-}
-
-.primary-action:hover {
-  background: #3d73e6;
-}
-
-.icon-button {
-  width: 40px;
-  padding: 0;
-}
-
 .slice-toolbar {
   flex: 1;
   min-width: min(100%, 620px);
@@ -1349,14 +1316,6 @@ canvas.slice-preview {
     position: static;
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .header-actions {
-    width: 100%;
-  }
-
-  .primary-action {
-    flex: 1;
   }
 
   .workspace {

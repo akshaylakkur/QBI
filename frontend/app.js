@@ -11,6 +11,7 @@ const state = {
   detections: [],
   selectedDetection: null,
   selectedMolecule: null,
+  labelsHidden: false,
   expandedMolecules: new Set(),
   currentSlices: { x: 0, y: 0, z: 0 },
   activeSliceAxis: "z",
@@ -43,9 +44,6 @@ function refreshAnnotationNumbers() {
 }
 
 function annotationLabel(detection) {
-  if (state.selectedDetection) {
-    return detection.type;
-  }
   return String(annotationNumbers.get(detectionKey(detection)) || "?");
 }
 
@@ -100,7 +98,6 @@ const elements = {
     y: document.querySelector("#y-slice-label"),
     z: document.querySelector("#z-slice-label")
   },
-  resetCamera: document.querySelector("#reset-camera"),
   sliceSliders: {
     x: document.querySelector("#x-slice-slider"),
     y: document.querySelector("#y-slice-slider"),
@@ -314,11 +311,7 @@ function visibleSliceAxesForDetection(detection) {
 }
 
 function annotationWorldPosition(detection) {
-  const visibleAxes = visibleSliceAxesForDetection(detection);
-  if (visibleAxes.length > 0) {
-    return detectionSliceWorldPosition(detection, visibleAxes[0]);
-  }
-  return state.selectedDetection ? detectionWorldPosition(detection) : null;
+  return detectionWorldPosition(detection);
 }
 
 function projectedViewerPosition(detection) {
@@ -342,6 +335,9 @@ function projectedViewerPosition(detection) {
 }
 
 function selectedAnnotationDetections() {
+  if (state.labelsHidden) {
+    return [];
+  }
   if (state.selectedDetection) {
     return [state.selectedDetection];
   }
@@ -351,7 +347,6 @@ function selectedAnnotationDetections() {
 
   return state.detections
     .filter((detection) => (detection.molecule || detection.type) === state.selectedMolecule)
-    .filter((detection) => visibleSliceAxesForDetection(detection).length > 0)
     .slice(0, annotationLimit);
 }
 
@@ -962,6 +957,7 @@ function renderDetectionList() {
   const totalPicks = state.detections.length;
   elements.detectionCount.textContent = `${groups.length} type${groups.length !== 1 ? "s" : ""} · ${totalPicks} picks`;
   elements.showAllBtn.hidden = state.selectedMolecule === null;
+  elements.showAllBtn.textContent = state.labelsHidden ? "Show all" : "Hide all";
 
   groups.forEach((group) => {
     const isSelected = state.selectedMolecule === group.molecule;
@@ -1214,6 +1210,7 @@ function showMoleculeGroupInfo(group) {
 function selectMoleculeGroup(molecule) {
   state.selectedMolecule = molecule;
   state.selectedDetection = null;
+  state.labelsHidden = false;
 
   const group = getMoleculeGroups().find((g) => g.molecule === molecule);
   if (group) {
@@ -1223,8 +1220,8 @@ function selectMoleculeGroup(molecule) {
 }
 
 function clearMoleculeSelection() {
-  state.selectedMolecule = null;
   state.selectedDetection = null;
+  state.labelsHidden = !state.labelsHidden;
   syncViewerAnnotations();
   renderDetectionList();
 }
@@ -1237,6 +1234,7 @@ function selectDetection(id) {
 
   state.selectedDetection = detection;
   state.selectedMolecule = detection.molecule || detection.type;
+  state.labelsHidden = false;
   state.expandedMolecules.add(state.selectedMolecule);
 
   focusSlicesOnDetection(detection);
@@ -1356,6 +1354,7 @@ async function loadPreview() {
   refreshAnnotationNumbers();
   state.selectedDetection = null;
   state.selectedMolecule = null;
+  state.labelsHidden = false;
   state.expandedMolecules.clear();
   state.currentSlices = {
     x: Math.floor(state.sliceShape.x / 2),
@@ -1656,6 +1655,7 @@ async function uploadLabelsFolder() {
   refreshAnnotationNumbers();
   state.selectedDetection = null;
   state.selectedMolecule = null;
+  state.labelsHidden = false;
   state.expandedMolecules.clear();
   const initialGroups = getMoleculeGroups();
   if (initialGroups.length > 0) {
@@ -1848,6 +1848,7 @@ function onInferenceComplete(data) {
     refreshAnnotationNumbers();
     state.selectedDetection = null;
     state.selectedMolecule = null;
+    state.labelsHidden = false;
     state.expandedMolecules.clear();
 
     const initialGroups = getMoleculeGroups();
@@ -1935,11 +1936,6 @@ elements.pointLimit.addEventListener("change", () => loadPreview().catch(showErr
 elements.upload.addEventListener("change", () => uploadZarrFolder().catch(showError));
 elements.labelsUpload.addEventListener("change", () => uploadLabelsFolder().catch(showError));
 elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch(showError));
-elements.resetCamera.addEventListener("click", () => {
-  camera.position.set(1.55, 1.25, 1.65);
-  controls.target.set(0, 0, 0);
-  controls.update();
-});
 elements.showAllBtn.addEventListener("click", clearMoleculeSelection);
 elements.runInference.addEventListener("click", () => runInference().catch(showError));
 sliceAxes.forEach((axis) => {
@@ -1951,11 +1947,7 @@ sliceAxes.forEach((axis) => {
     setSliceSliderValue(axis);
     setActiveSliceAxis(axis);
     updateSliceSeams();
-    if (state.selectedMolecule && !state.selectedDetection) {
-      syncViewerAnnotations();
-    } else {
-      updateAnnotationPositions();
-    }
+    updateAnnotationPositions();
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });
