@@ -25,6 +25,13 @@ const latestAggregation = new Map();
 
 // Inference progress tracking (SSE)
 const inferenceEmitters = new Map();
+const crowdingEmitters = new Map();
+
+function emitJobEvent(emitter, event, payload) {
+  if (emitter?.listenerCount(event) > 0) {
+    emitter.emit(event, payload);
+  }
+}
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -1434,7 +1441,7 @@ sys.stdout.buffer.write(pixels.tobytes(order="C"))
 `;
 
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", [
+    const child = spawn(pythonExecutable(), [
       "-c",
       script,
       zarrPath,
@@ -1625,51 +1632,55 @@ async function handleApi(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/zarr/slice") {
-    const zarrPath = resolveScanPath(url.searchParams.get("path"));
-    if (!zarrPath) {
-      sendJson(res, 400, { error: "Invalid scan path" });
-      return;
+    try {
+      const zarrPath = resolveScanPath(url.searchParams.get("path"));
+      if (!zarrPath) {
+        sendJson(res, 400, { error: "Invalid scan path" });
+        return;
+      }
+
+      const axis = ["x", "y", "z"].includes(url.searchParams.get("axis")) ? url.searchParams.get("axis") : "z";
+      const level = url.searchParams.get("level") || "2";
+      const sourceLevel = url.searchParams.get("sourceLevel") || level;
+      const sourceIndex = Number.parseInt(url.searchParams.get("index") || url.searchParams.get(axis) || url.searchParams.get("z") || "0", 10);
+      const maxSize = Math.max(64, Math.min(1024, Number.parseInt(url.searchParams.get("maxSize") || "0", 10) || 1024));
+      let sourceShape = null;
+
+      if (sourceLevel !== level) {
+        sourceShape = (await readZarrLevelShapes(zarrPath))[sourceLevel] || null;
+      }
+
+      const levelShapes = await readZarrLevelShapes(zarrPath);
+      const shape = levelShapes[level];
+      if (!shape) {
+        sendJson(res, 400, { error: `Zarr level ${level} was not found` });
+        return;
+      }
+
+      const axisSize = shape[axis];
+      const sourceAxisSize = sourceShape?.[axis] || axisSize;
+      const mappedIndex = sourceShape
+        ? Math.round((Math.max(0, Math.min(sourceAxisSize - 1, sourceIndex)) / Math.max(1, sourceAxisSize - 1)) * (axisSize - 1))
+        : sourceIndex;
+      const sliceIndex = Math.max(0, Math.min(axisSize - 1, Number.isFinite(mappedIndex) ? mappedIndex : Math.floor(axisSize / 2)));
+      const { meta, pixels } = await loadCachedPythonZarrSlice(zarrPath, level, axis, sliceIndex, maxSize);
+
+      sendBuffer(res, 200, pixels, "application/octet-stream", {
+        "X-QBI-Slice-Axis": axis,
+        "X-QBI-Slice-Level": meta.level,
+        "X-QBI-Slice-Index": String(meta.index),
+        "X-QBI-Slice-Z": String(meta.index),
+        "X-QBI-Slice-Width": String(meta.width),
+        "X-QBI-Slice-Height": String(meta.height),
+        "X-QBI-Slice-Source-Width": String(meta.sourceWidth),
+        "X-QBI-Slice-Source-Height": String(meta.sourceHeight),
+        "X-QBI-Slice-Depth": String(meta.depth),
+        "X-QBI-Slice-Low": String(meta.low),
+        "X-QBI-Slice-High": String(meta.high)
+      });
+    } catch (error) {
+      sendJson(res, 500, { error: error.message || String(error) });
     }
-
-    const axis = ["x", "y", "z"].includes(url.searchParams.get("axis")) ? url.searchParams.get("axis") : "z";
-    const level = url.searchParams.get("level") || "2";
-    const sourceLevel = url.searchParams.get("sourceLevel") || level;
-    const sourceIndex = Number.parseInt(url.searchParams.get("index") || url.searchParams.get(axis) || url.searchParams.get("z") || "0", 10);
-    const maxSize = Math.max(64, Math.min(1024, Number.parseInt(url.searchParams.get("maxSize") || "0", 10) || 1024));
-    let sourceShape = null;
-
-    if (sourceLevel !== level) {
-      sourceShape = (await readZarrLevelShapes(zarrPath))[sourceLevel] || null;
-    }
-
-    const levelShapes = await readZarrLevelShapes(zarrPath);
-    const shape = levelShapes[level];
-    if (!shape) {
-      sendJson(res, 400, { error: `Zarr level ${level} was not found` });
-      return;
-    }
-
-    const axisSize = shape[axis];
-    const sourceAxisSize = sourceShape?.[axis] || axisSize;
-    const mappedIndex = sourceShape
-      ? Math.round((Math.max(0, Math.min(sourceAxisSize - 1, sourceIndex)) / Math.max(1, sourceAxisSize - 1)) * (axisSize - 1))
-      : sourceIndex;
-    const sliceIndex = Math.max(0, Math.min(axisSize - 1, Number.isFinite(mappedIndex) ? mappedIndex : Math.floor(axisSize / 2)));
-    const { meta, pixels } = await loadCachedPythonZarrSlice(zarrPath, level, axis, sliceIndex, maxSize);
-
-    sendBuffer(res, 200, pixels, "application/octet-stream", {
-      "X-QBI-Slice-Axis": axis,
-      "X-QBI-Slice-Level": meta.level,
-      "X-QBI-Slice-Index": String(meta.index),
-      "X-QBI-Slice-Z": String(meta.index),
-      "X-QBI-Slice-Width": String(meta.width),
-      "X-QBI-Slice-Height": String(meta.height),
-      "X-QBI-Slice-Source-Width": String(meta.sourceWidth),
-      "X-QBI-Slice-Source-Height": String(meta.sourceHeight),
-      "X-QBI-Slice-Depth": String(meta.depth),
-      "X-QBI-Slice-Low": String(meta.low),
-      "X-QBI-Slice-High": String(meta.high)
-    });
     return;
   }
 
@@ -1895,6 +1906,142 @@ async function handleApi(req, res) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/graph/hemisphere") {
+    try {
+      const body = await readRequestJson(req);
+      const detections = Array.isArray(body.detections) ? body.detections : [];
+      if (detections.length === 0) {
+        sendJson(res, 400, { error: "No picks available for hemisphere query" });
+        return;
+      }
+      const pickId = body.pickId || body.pick_id;
+      if (!pickId) {
+        sendJson(res, 400, { error: "pickId required" });
+        return;
+      }
+      const result = await runGraphApi({
+        mode: "hemisphere",
+        tomo_id: body.tomoId || "scan",
+        pick_id: pickId,
+        detections: slimDetectionsForGraph(detections),
+        n_rays: body.nRays || 2000
+      });
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, { error: error.message || String(error) });
+    }
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/graph/gvi") {
+    try {
+      const body = await readRequestJson(req);
+      const detections = Array.isArray(body.detections) ? body.detections : [];
+      if (detections.length === 0) {
+        sendJson(res, 400, { error: "No picks available for grid viability assessment" });
+        return;
+      }
+      const result = await runGraphApi({
+        mode: "gvi",
+        tomo_id: body.tomoId || "scan",
+        detections: slimDetectionsForGraph(detections)
+      });
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, { error: error.message || String(error) });
+    }
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/graph/crowding/progress") {
+    const jobId = url.searchParams.get("jobId");
+    if (!jobId) {
+      sendJson(res, 400, { error: "jobId required" });
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*"
+    });
+
+    const emitter = crowdingEmitters.get(jobId) || new EventEmitter();
+    crowdingEmitters.set(jobId, emitter);
+
+    const onProgress = (data) => {
+      res.write(`event: progress\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    const onComplete = (data) => {
+      res.write(`event: complete\ndata: ${JSON.stringify(data)}\n\n`);
+      res.end();
+      cleanup();
+      clearInterval(keepAlive);
+    };
+    const onError = (err) => {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || String(err) })}\n\n`);
+      res.end();
+      cleanup();
+      clearInterval(keepAlive);
+    };
+
+    const cleanup = () => {
+      emitter.removeListener("progress", onProgress);
+      emitter.removeListener("complete", onComplete);
+      emitter.removeListener("error", onError);
+      crowdingEmitters.delete(jobId);
+    };
+
+    emitter.on("progress", onProgress);
+    emitter.on("complete", onComplete);
+    emitter.on("error", onError);
+
+    const keepAlive = setInterval(() => {
+      res.write(": keepalive\n\n");
+    }, 15000);
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      cleanup();
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/graph/crowding/run") {
+    try {
+      const body = await readRequestJson(req);
+      const detections = Array.isArray(body.detections) ? body.detections : [];
+      if (detections.length === 0) {
+        sendJson(res, 400, { error: "No picks available for crowding analysis" });
+        return;
+      }
+
+      const jobId = body.jobId || `crowd-${Date.now()}`;
+      if (!crowdingEmitters.has(jobId)) {
+        crowdingEmitters.set(jobId, new EventEmitter());
+      }
+      const emitter = crowdingEmitters.get(jobId);
+
+      sendJson(res, 200, { jobId, status: "started" });
+
+      runCrowdingProcess(
+        {
+          mode: "crowding",
+          tomo_id: body.tomoId || "scan",
+          detections: slimDetectionsForGraph(detections),
+          n_rays: body.nRays || 2000,
+          checkpoint: body.checkpoint || defaultGnnCheckpoint
+        },
+        emitter
+      ).catch((err) => {
+        emitJobEvent(emitter, "error", { message: err.message || String(err) });
+      });
+    } catch (error) {
+      sendJson(res, 500, { error: error.message || String(error) });
+    }
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/inference/run") {
     const body = await readRequestJson(req);
     const zarrPath = body.zarrPath;
@@ -1932,7 +2079,7 @@ async function handleApi(req, res) {
 
     // Run inference asynchronously
     runInferenceProcess(resolvedPath, scanId, emitter).catch((err) => {
-      emitter.emit("error", { message: err.message || String(err) });
+      emitJobEvent(emitter, "error", { message: err.message || String(err) });
     });
     return;
   }
@@ -1963,12 +2110,131 @@ async function handleApi(req, res) {
 
 const projectRoot = path.resolve(__dirname, "..");
 const inferenceScript = path.join(projectRoot, "backend", "inference", "run_inference_direct.py");
+const graphApiModule = "downstream.scripts.frontend_graph_api";
+const defaultGnnCheckpoint = path.join(projectRoot, "runs", "exposure_gnn.pt");
 const hardcodedCheckpoint = path.resolve(os.homedir(), "Downloads", "czii-weights", "weight_best.ckpt");
+
+function pythonExecutable() {
+  const venvPython = path.join(projectRoot, ".venv", "bin", "python");
+  return fs.existsSync(venvPython) ? venvPython : "python3";
+}
+
+function slimDetectionsForGraph(detections) {
+  return detections.map((det) => ({
+    id: det.id,
+    molecule: det.molecule || det.type,
+    type: det.type,
+    radiusAngstrom: det.radiusAngstrom,
+    physical: det.physical
+      ? { x: det.physical.x, y: det.physical.y, z: det.physical.z }
+      : undefined
+  }));
+}
+
+function runGraphApi(payload) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      pythonExecutable(),
+      ["-m", graphApiModule],
+      {
+        cwd: projectRoot,
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+
+    const stderrChunks = [];
+    child.stdin.write(JSON.stringify(payload));
+    child.stdin.end();
+
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrChunks.push(chunk.toString("utf8"));
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const stderr = stderrChunks.join("");
+        reject(new Error(stderr.split("\n").filter(Boolean).slice(-3).join("; ") || `Graph API exited ${code}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (error) {
+        reject(new Error(`Failed to parse graph API output: ${error.message}`));
+      }
+    });
+  });
+}
+
+async function runCrowdingProcess(payload, emitter) {
+  emitter.emit("progress", { percent: 0, message: "Starting crowding analysis…" });
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      pythonExecutable(),
+      ["-m", graphApiModule],
+      {
+        cwd: projectRoot,
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+
+    const stderrChunks = [];
+    child.stdin.write(JSON.stringify(payload));
+    child.stdin.end();
+
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      stderrChunks.push(text);
+      const progressMatch = text.match(/__QBI_PROGRESS__:([0-9.]+):(.+)/);
+      if (progressMatch) {
+        const fraction = Number.parseFloat(progressMatch[1]);
+        emitter.emit("progress", {
+          percent: Math.round(fraction * 100),
+          message: progressMatch[2].trim()
+        });
+      }
+    });
+
+    child.on("error", (err) => {
+      emitJobEvent(emitter, "error", { message: err.message });
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const stderr = stderrChunks.join("");
+        const errorMsg = stderr.split("\n").filter((l) => l && !l.startsWith("__QBI_")).slice(-3).join("; ");
+        emitJobEvent(emitter, "error", { message: errorMsg || `Crowding analysis failed (exit ${code})` });
+        reject(new Error(errorMsg));
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout);
+        emitter.emit("complete", result);
+        resolve(result);
+      } catch (error) {
+        emitJobEvent(emitter, "error", { message: error.message });
+        reject(error);
+      }
+    });
+  });
+}
 
 async function runInferenceProcess(zarrPath, scanId, emitter) {
   const checkpoint = hardcodedCheckpoint;
   if (!fs.existsSync(checkpoint)) {
-    emitter.emit("error", { message: `Checkpoint not found at ${checkpoint}. Please ensure the file exists.` });
+    emitJobEvent(emitter, "error", { message: `Checkpoint not found at ${checkpoint}. Please ensure the file exists.` });
     return;
   }
 
@@ -2003,7 +2269,7 @@ async function runInferenceProcess(zarrPath, scanId, emitter) {
 
   emitter.emit("progress", { phase: "loading", percent: 0, message: "Starting inference..." });
 
-  const child = spawn("python3", args, {
+  const child = spawn(pythonExecutable(), args, {
     cwd: projectRoot,
     env,
     stdio: ["ignore", "pipe", "pipe"]
@@ -2058,14 +2324,14 @@ async function runInferenceProcess(zarrPath, scanId, emitter) {
   });
 
   child.on("error", (err) => {
-    emitter.emit("error", { message: `Failed to start inference: ${err.message}` });
+    emitJobEvent(emitter, "error", { message: `Failed to start inference: ${err.message}` });
   });
 
   child.on("close", async (code) => {
     if (code !== 0) {
       const stderr = stderrChunks.join("");
       const errorMsg = stderr.split("\n").filter((l) => l && !l.startsWith("__QBI_")).slice(-5).join("; ");
-      emitter.emit("error", { message: `Inference failed (exit ${code}): ${errorMsg || "Unknown error"}` });
+      emitJobEvent(emitter, "error", { message: `Inference failed (exit ${code}): ${errorMsg || "Unknown error"}` });
       return;
     }
 
@@ -2166,7 +2432,7 @@ async function runInferenceProcess(zarrPath, scanId, emitter) {
         numDetections: detections.length
       });
     } catch (err) {
-      emitter.emit("error", { message: `Failed to process predictions: ${err.message}` });
+      emitJobEvent(emitter, "error", { message: `Failed to process predictions: ${err.message}` });
     }
   });
 }

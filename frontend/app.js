@@ -15,7 +15,13 @@ const state = {
   expandedMolecules: new Set(),
   currentSlices: { x: 0, y: 0, z: 0 },
   activeSliceAxis: "z",
-  autoRotate: false
+  autoRotate: false,
+  overlayColorMode: "type",
+  gvi: null,
+  crowdingSummary: null,
+  neighborMap: new Map(),
+  datasetAnalysis: null,
+  minOcclusionFilter: 0
 };
 
 function getMoleculeGroups() {
@@ -44,6 +50,9 @@ function refreshAnnotationNumbers() {
 }
 
 function annotationLabel(detection) {
+  if (state.selectedDetection) {
+    return detection.type;
+  }
   return String(annotationNumbers.get(detectionKey(detection)) || "?");
 }
 
@@ -81,6 +90,7 @@ const elements = {
   analysisStatus: document.querySelector("#analysis-status"),
   analysisSummary: document.querySelector("#analysis-summary"),
   analysisReport: document.querySelector("#analysis-report"),
+  crowdingSummary: document.querySelector("#crowding-summary"),
   showAllBtn: document.querySelector("#show-all-molecules"),
   detectionList: document.querySelector("#detection-list"),
   selectedId: document.querySelector("#selected-id"),
@@ -116,7 +126,31 @@ const elements = {
   runInference: document.querySelector("#run-inference"),
   inferenceProgress: document.querySelector("#inference-progress"),
   inferenceProgressFill: document.querySelector("#inference-progress-fill"),
-  inferenceStatus: document.querySelector("#inference-status")
+  inferenceStatus: document.querySelector("#inference-status"),
+  runCrowding: document.querySelector("#run-crowding"),
+  crowdingProgress: document.querySelector("#crowding-progress"),
+  crowdingProgressFill: document.querySelector("#crowding-progress-fill"),
+  crowdingStatus: document.querySelector("#crowding-status"),
+  qaStatus: document.querySelector("#qa-status"),
+  qaDetail: document.querySelector("#qa-detail"),
+  overlayColorMode: document.querySelector("#overlay-color-mode"),
+  selectedExposure: document.querySelector("#selected-exposure"),
+  selectedCleanExtraction: document.querySelector("#selected-clean-extraction"),
+  selectedAnisotropy: document.querySelector("#selected-anisotropy"),
+  selectedOpenDirection: document.querySelector("#selected-open-direction"),
+  selectedGnnExposure: document.querySelector("#selected-gnn-exposure"),
+  selectedNeighbors: document.querySelector("#selected-neighbors"),
+  graphPanel: document.querySelector("#graph-panel"),
+  graphViewer: document.querySelector("#graph-viewer"),
+  graphCaption: document.querySelector("#graph-caption"),
+  graphPickLabel: document.querySelector("#graph-pick-label"),
+  resetGraphCamera: document.querySelector("#reset-graph-camera"),
+  viewerRow: document.querySelector(".viewer-row"),
+  occlusionFilterPanel: document.querySelector("#occlusion-filter-panel"),
+  occlusionFilterSlider: document.querySelector("#occlusion-filter-slider"),
+  occlusionFilterValue: document.querySelector("#occlusion-filter-value"),
+  occlusionFilterStats: document.querySelector("#occlusion-filter-stats"),
+  exportCleanPicks: document.querySelector("#export-clean-picks")
 };
 
 const scene = new THREE.Scene();
@@ -145,6 +179,10 @@ controls.target.set(0, 0, 0);
 const volumeGroup = new THREE.Group();
 scene.add(volumeGroup);
 
+const picksGroup = new THREE.Group();
+picksGroup.name = "pick-overlays";
+volumeGroup.add(picksGroup);
+
 const slicePlaneObjects = { x: null, y: null, z: null };
 const sliceRequestIds = { x: 0, y: 0, z: 0 };
 
@@ -155,6 +193,31 @@ scene.add(keyLight);
 const rimLight = new THREE.DirectionalLight(0x8ddbf0, 0.7);
 rimLight.position.set(-2.5, -1.8, -1.5);
 scene.add(rimLight);
+
+const GRAPH_SCALE = 0.0025;
+const graphScene = new THREE.Scene();
+graphScene.background = new THREE.Color(0xf4f7f8);
+
+const graphCamera = new THREE.PerspectiveCamera(50, 1, 0.001, 100);
+graphCamera.position.set(0.85, 0.65, 1.05);
+
+const graphRenderer = new THREE.WebGLRenderer({ antialias: true });
+graphRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+elements.graphViewer.appendChild(graphRenderer.domElement);
+
+const graphControls = new OrbitControls(graphCamera, graphRenderer.domElement);
+graphControls.enableDamping = true;
+graphControls.dampingFactor = 0.08;
+graphControls.target.set(0, 0, 0);
+
+const graphGroup = new THREE.Group();
+const hemisphereGroup = new THREE.Group();
+graphGroup.add(hemisphereGroup);
+graphScene.add(graphGroup);
+graphScene.add(new THREE.AmbientLight(0xffffff, 1.15));
+const graphKeyLight = new THREE.DirectionalLight(0xffffff, 1.1);
+graphKeyLight.position.set(1.5, 2, 1.2);
+graphScene.add(graphKeyLight);
 
 function setStatus(text, active = false) {
   elements.loadStatus.textContent = text;
@@ -181,6 +244,362 @@ function hideLoadingScreen() {
   elements.message.textContent = "";
 }
 
+function currentTomoId() {
+  if (!state.selectedScan) {
+    return "scan";
+  }
+  const parts = state.selectedScan.split("/");
+  const base = parts[parts.length - 1] || "scan";
+  return base.replace(/\.zarr$/i, "");
+}
+
+function gviStatusLabel(status) {
+  const labels = {
+    pass: "QA pass",
+    warn: "QA warn",
+    fail_static: "QA fail (static)",
+    fail_blob: "QA fail (blob)",
+    insufficient: "QA insufficient"
+  };
+  return labels[status] || "QA";
+}
+
+function renderGvi(gvi) {
+  state.gvi = gvi || null;
+  if (!gvi) {
+    elements.qaStatus.hidden = true;
+    elements.qaDetail.hidden = true;
+    return;
+  }
+
+  elements.qaStatus.hidden = false;
+  elements.qaDetail.hidden = false;
+  elements.qaStatus.textContent = gviStatusLabel(gvi.status);
+  elements.qaStatus.className = `status-pill qa-pill qa-${gvi.status === "fail_static" || gvi.status === "fail_blob" ? "fail" : gvi.status}`;
+
+  const hopkins = Number.isFinite(gvi.hopkins_h) ? gvi.hopkins_h.toFixed(3) : "—";
+  const knn = Number.isFinite(gvi.mean_knn_dist) ? `${Math.round(gvi.mean_knn_dist)} Å` : "—";
+  elements.qaDetail.textContent = `Hopkins H ${hopkins} · ${gvi.n_particles} particles · mean kNN ${knn}. ${gvi.message || ""}`;
+}
+
+function shouldBlockInferenceForGvi() {
+  const status = state.gvi?.status;
+  return status === "fail_static" || status === "fail_blob";
+}
+
+async function runGviAfterPicks() {
+  if (!state.detections.length) {
+    renderGvi(null);
+    elements.runCrowding.disabled = true;
+    return;
+  }
+
+  elements.runCrowding.disabled = false;
+
+  try {
+    const payload = await fetchJson("/api/graph/gvi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tomoId: currentTomoId(),
+        detections: state.detections
+      })
+    });
+    renderGvi(payload.gvi);
+  } catch (error) {
+    console.warn("GVI assessment failed:", error);
+    renderGvi(null);
+  }
+}
+
+function applyCrowdingResult(result) {
+  if (!result?.picks?.length) {
+    return;
+  }
+
+  const byId = new Map(result.picks.map((pick) => [pick.id, pick]));
+  state.neighborMap.clear();
+  state.detections = state.detections.map((det) => {
+    const enriched = byId.get(det.id);
+    if (!enriched) {
+      return det;
+    }
+    if (Array.isArray(enriched.neighbors)) {
+      state.neighborMap.set(det.id, enriched.neighbors);
+    }
+    return {
+      ...det,
+      stericExposure: enriched.stericExposure,
+      gnnExposure: enriched.gnnExposure,
+      neighborCount: enriched.neighborCount,
+      anisotropyIndex: enriched.anisotropyIndex,
+      cleanExtractionScore: enriched.cleanExtractionScore,
+      openDirection: enriched.openDirection,
+      cleanConeHalfAngleDeg: enriched.cleanConeHalfAngleDeg,
+      nOpenComponents: enriched.nOpenComponents
+    };
+  });
+
+  state.crowdingSummary = result.summary || null;
+  if (result.gvi) {
+    renderGvi(result.gvi);
+  }
+
+  if (state.selectedDetection) {
+    const refreshed = state.detections.find((d) => d.id === state.selectedDetection.id);
+    if (refreshed) {
+      state.selectedDetection = refreshed;
+      showPickInfo(refreshed);
+      renderGraphPanel(refreshed);
+    }
+  } else {
+    renderGraphPanel(null);
+  }
+
+  renderDetectionList();
+  renderExposureSummary(result.summary);
+  updateOcclusionFilterUI();
+  syncPickOverlays();
+  refreshSlicePreviews();
+  syncViewerAnnotations();
+  updateGraphPanelVisibility();
+}
+
+function renderExposureSummary(summary) {
+  if (!elements.crowdingSummary) {
+    return;
+  }
+
+  if (!summary) {
+    elements.crowdingSummary.hidden = true;
+    elements.crowdingSummary.replaceChildren();
+    updateGraphPanelVisibility();
+    return;
+  }
+
+  elements.crowdingSummary.hidden = false;
+  const byType = summary.byType || {};
+  const typeRows = Object.entries(byType)
+    .sort((a, b) => (b[1].count || 0) - (a[1].count || 0))
+    .map(
+      ([type, stats]) => `
+        <tr>
+          <td>${type}</td>
+          <td>${stats.count ?? 0}</td>
+          <td>${stats.meanCleanExtraction?.toFixed(3) ?? stats.meanExposure?.toFixed(3) ?? "—"}</td>
+          <td>${stats.meanExposure?.toFixed(3) ?? "—"}</td>
+        </tr>`
+    )
+    .join("");
+
+  elements.crowdingSummary.innerHTML = `
+    <p class="crowding-heading">Crowding analyzed (${summary.nRays ?? 2000} rays)</p>
+    <div class="crowding-stats-compact">
+      <span><strong>${summary.particleCount ?? 0}</strong> particles</span>
+      <span>clean ${summary.meanCleanExtraction?.toFixed(3) ?? "—"}</span>
+      <span>P10 ${summary.p10CleanExtraction?.toFixed(3) ?? "—"}</span>
+      <span>exp ${summary.meanExposure?.toFixed(3) ?? "—"}</span>
+    </div>
+    ${
+      typeRows
+        ? `<table class="crowding-type-table">
+            <thead><tr><th>Type</th><th>Count</th><th>Mean clean</th><th>Mean exp.</th></tr></thead>
+            <tbody>${typeRows}</tbody>
+          </table>`
+        : ""
+    }
+  `;
+
+  updateGraphPanelVisibility();
+}
+
+function getDetectionPhysical(detection) {
+  if (detection?.physical && Number.isFinite(detection.physical.x)) {
+    return detection.physical;
+  }
+  const voxel = detection?.voxel;
+  if (!voxel) {
+    return null;
+  }
+  const spacing = 10;
+  return {
+    x: voxel.x * spacing,
+    y: voxel.y * spacing,
+    z: voxel.z * spacing
+  };
+}
+
+function graphPositionFromPhysical(physical, origin) {
+  return new THREE.Vector3(
+    (physical.x - origin.x) * GRAPH_SCALE,
+    (physical.z - origin.z) * GRAPH_SCALE,
+    -((physical.y - origin.y) * GRAPH_SCALE)
+  );
+}
+
+function graphNodeRadius(detection) {
+  const radiusAngstrom = detection?.radiusAngstrom || moleculeRadiusAngstrom(detection) || 60;
+  return Math.max(0.016, radiusAngstrom * GRAPH_SCALE * 0.85);
+}
+
+function graphMaterialForDetection(detection, { highlight = false } = {}) {
+  const hex = detection?.color || "#0b7f83";
+  const color = new THREE.Color(hex);
+  return new THREE.MeshStandardMaterial({
+    color,
+    emissive: highlight ? color.clone().multiplyScalar(0.35) : new THREE.Color(0x000000),
+    emissiveIntensity: highlight ? 0.28 : 0,
+    roughness: 0.45,
+    metalness: 0.05
+  });
+}
+
+function updateGraphPanelVisibility() {
+  const showPanel = Boolean(state.crowdingSummary);
+  elements.graphPanel.hidden = !showPanel;
+  elements.viewerRow?.classList.toggle("has-graph", showPanel);
+  if (showPanel) {
+    resizeGraphViewer();
+  }
+}
+
+function setGraphCaption(text) {
+  elements.graphCaption.textContent = text;
+}
+
+function frameGraphCamera(maxDistance) {
+  const distance = Math.max(0.35, maxDistance * 1.75);
+  graphCamera.position.set(distance * 0.85, distance * 0.62, distance * 1.05);
+  graphControls.target.set(0, 0, 0);
+  graphControls.update();
+}
+
+function renderGraphPanel(detection) {
+  clearGroup(graphGroup);
+  graphGroup.add(hemisphereGroup);
+
+  if (!state.crowdingSummary) {
+    updateGraphPanelVisibility();
+    return;
+  }
+
+  updateGraphPanelVisibility();
+
+  if (!detection) {
+    elements.graphPickLabel.textContent = "Neighborhood";
+    setGraphCaption("Select a pick to view its local particle graph.");
+    return;
+  }
+
+  const neighbors = state.neighborMap.get(detection.id) || [];
+  const centerPhys = getDetectionPhysical(detection);
+  if (!centerPhys) {
+    elements.graphPickLabel.textContent = detection.id;
+    setGraphCaption("Pick coordinates unavailable for graph rendering.");
+    return;
+  }
+
+  elements.graphPickLabel.textContent = detection.id;
+  if (!neighbors.length) {
+    setGraphCaption("No neighbors within cutoff for this pick.");
+    return;
+  }
+
+  const cleanScore = detectionStaScore(detection);
+  const openDir = detection.openDirection;
+  setGraphCaption(
+    `${detection.type || detection.molecule} · ${neighbors.length} neighbors${
+      cleanScore !== null ? ` · clean ${cleanScore.toFixed(2)}` : ""
+    }${openDir ? ` · open ${formatOpenDirectionLabel(openDir)}` : ""}`
+  );
+
+  const centerMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(graphNodeRadius(detection), 20, 20),
+    graphMaterialForDetection(detection, { highlight: true })
+  );
+  graphGroup.add(centerMesh);
+
+  const linePositions = [];
+  let maxDistance = 0.2;
+
+  neighbors.forEach((neighbor) => {
+    const neighborDet = state.detections.find((d) => d.id === neighbor.id);
+    const phys = neighborDet ? getDetectionPhysical(neighborDet) : neighbor.physical;
+    if (!phys) {
+      return;
+    }
+
+    const pos = graphPositionFromPhysical(phys, centerPhys);
+    maxDistance = Math.max(maxDistance, pos.length());
+
+    const node = new THREE.Mesh(
+      new THREE.SphereGeometry(graphNodeRadius(neighborDet || detection), 16, 16),
+      graphMaterialForDetection(neighborDet || { color: detection.color, radiusAngstrom: detection.radiusAngstrom })
+    );
+    node.position.copy(pos);
+    graphGroup.add(node);
+
+    linePositions.push(0, 0, 0, pos.x, pos.y, pos.z);
+  });
+
+  if (linePositions.length) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(linePositions, 3));
+    graphGroup.add(
+      new THREE.LineSegments(
+        geometry,
+        new THREE.LineBasicMaterial({ color: 0x6a858c, transparent: true, opacity: 0.5 })
+      )
+    );
+  }
+
+  frameGraphCamera(maxDistance);
+  resizeGraphViewer();
+
+  const shellRadius = Math.max(0.14, maxDistance * 0.55);
+  fetchHemisphereForPick(detection).then((hemisphereData) => {
+    if (state.selectedDetection?.id !== detection.id) {
+      return;
+    }
+    renderHemisphereHeatmap(hemisphereData, shellRadius);
+  });
+}
+
+function resizeGraphViewer() {
+  if (elements.graphPanel.hidden) {
+    return;
+  }
+
+  const rect = elements.graphViewer.getBoundingClientRect();
+  graphCamera.aspect = rect.width / Math.max(1, rect.height);
+  graphCamera.updateProjectionMatrix();
+  graphRenderer.setSize(rect.width, rect.height, false);
+}
+
+function physicalToWorld(physical) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape;
+  if (!shape || !physical) {
+    return new THREE.Vector3();
+  }
+
+  const spacing = 10;
+  const dimensions = volumeDimensions();
+  const voxel = {
+    x: Number(physical.x) / spacing,
+    y: Number(physical.y) / spacing,
+    z: Number(physical.z) / spacing
+  };
+  return new THREE.Vector3(
+    ((voxel.x / Math.max(1, shape.x - 1)) - 0.5) * dimensions.x,
+    -((voxel.y / Math.max(1, shape.y - 1)) - 0.5) * dimensions.y,
+    ((voxel.z / Math.max(1, shape.z - 1)) - 0.5) * dimensions.z
+  );
+}
+
+function sortedPicks(picks) {
+  return [...picks].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+}
+
 function resizeViewer() {
   const rect = elements.viewer.getBoundingClientRect();
   camera.aspect = rect.width / Math.max(1, rect.height);
@@ -189,7 +608,299 @@ function resizeViewer() {
   updateAnnotationPositions();
 }
 
+function detectionExposureValue(detection) {
+  const value = detection?.gnnExposure ?? detection?.stericExposure;
+  return Number.isFinite(value) ? value : null;
+}
+
+function detectionStaScore(detection) {
+  const value = detection?.cleanExtractionScore;
+  return Number.isFinite(value) ? value : null;
+}
+
+function hasExposureData() {
+  return state.detections.some((det) => detectionStaScore(det) !== null);
+}
+
+function passesOcclusionFilter(detection) {
+  if (state.minOcclusionFilter <= 0) {
+    return true;
+  }
+  const score = detectionStaScore(detection);
+  if (score === null) {
+    return false;
+  }
+  return score >= state.minOcclusionFilter;
+}
+
+function visibleDetections() {
+  return state.detections.filter(passesOcclusionFilter);
+}
+
+function occlusionFilterThresholdFromSlider() {
+  return Number(elements.occlusionFilterSlider?.value || 0) / 100;
+}
+
+function updateOcclusionFilterUI() {
+  if (!elements.occlusionFilterPanel) {
+    return;
+  }
+
+  const enabled = hasExposureData();
+  elements.occlusionFilterPanel.hidden = !enabled;
+  if (!enabled) {
+    return;
+  }
+
+  const threshold = state.minOcclusionFilter;
+  if (elements.occlusionFilterValue) {
+    elements.occlusionFilterValue.textContent = threshold.toFixed(2);
+  }
+  if (elements.occlusionFilterSlider) {
+    elements.occlusionFilterSlider.value = String(Math.round(threshold * 100));
+    elements.occlusionFilterSlider.setAttribute("aria-valuenow", threshold.toFixed(2));
+  }
+
+  const visibleCount = visibleDetections().length;
+  const total = state.detections.length;
+  if (elements.occlusionFilterStats) {
+    elements.occlusionFilterStats.textContent =
+      threshold > 0
+        ? `${visibleCount} / ${total} picks pass filter (≥ ${threshold.toFixed(2)} clean extraction)`
+        : `${total} picks visible · slide to prune low clean-extraction particles for STA`;
+  }
+  if (elements.exportCleanPicks) {
+    elements.exportCleanPicks.disabled = visibleCount === 0;
+  }
+}
+
+function applyOcclusionFilter() {
+  state.minOcclusionFilter = occlusionFilterThresholdFromSlider();
+  updateOcclusionFilterUI();
+  renderDetectionList();
+  syncPickOverlays();
+  syncViewerAnnotations();
+  refreshSlicePreviews();
+  if (state.selectedDetection && !passesOcclusionFilter(state.selectedDetection)) {
+    elements.selectedNotes.textContent = `${state.selectedDetection.notes} Filtered out by clean extraction gate (score below ${state.minOcclusionFilter.toFixed(2)}).`;
+  }
+}
+
+function syncPickOverlays() {
+  clearGroup(picksGroup);
+  if (!state.detections.length) {
+    return;
+  }
+
+  state.detections.forEach((detection) => {
+    const position = detectionWorldPosition(detection);
+    if (!position) {
+      return;
+    }
+
+    const visible = passesOcclusionFilter(detection);
+    const radius = Math.max(0.008, moleculeRadiusWorld(detection) * 0.55);
+    const [r, g, b] = detectionColorArray(detection);
+    const color = new THREE.Color(r / 255, g / 255, b / 255);
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(radius, 14, 14),
+      new THREE.MeshStandardMaterial({
+        color,
+        emissive: color.clone().multiplyScalar(visible ? 0.22 : 0),
+        emissiveIntensity: visible ? 0.35 : 0,
+        transparent: true,
+        opacity: visible ? 0.62 : 0.05,
+        depthWrite: false
+      })
+    );
+    mesh.position.copy(position);
+    mesh.userData.detectionId = detection.id;
+    picksGroup.add(mesh);
+  });
+}
+
+function exportCleanCopickPicks() {
+  const visible = visibleDetections();
+  if (!visible.length) {
+    showError(new Error("No picks pass the current clean extraction filter."));
+    return;
+  }
+
+  const byMolecule = new Map();
+  visible.forEach((detection) => {
+    const molecule = detection.molecule || detection.type || "unknown";
+    if (!byMolecule.has(molecule)) {
+      byMolecule.set(molecule, []);
+    }
+    byMolecule.get(molecule).push(detection);
+  });
+
+  const files = [...byMolecule.entries()].map(([molecule, picks]) => ({
+    pickable_object_name: molecule,
+    user_id: "qbi",
+    session_id: "0",
+    run_name: currentTomoId(),
+    voxel_spacing: null,
+    unit: picks[0]?.physical?.unit || "angstrom",
+    trust_orientation: true,
+    points: picks.map((detection) => {
+      const physical = getDetectionPhysical(detection);
+      const openDir = detection.openDirection;
+      const transform = openDir && Number.isFinite(openDir.x)
+        ? rotationMatrixFromOpenDirection(openDir)
+        : [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+          ];
+      return {
+        location: {
+          x: physical?.x ?? 0,
+          y: physical?.y ?? 0,
+          z: physical?.z ?? 0
+        },
+        transformation_: transform,
+        instance_id: 0,
+        score: detectionStaScore(detection) ?? 1,
+        open_direction: openDir || null,
+        anisotropy_index: detection.anisotropyIndex ?? null,
+        steric_exposure: detection.stericExposure ?? null
+      };
+    })
+  }));
+
+  const payload = {
+    export_format: "copick_bundle",
+    exported_at: new Date().toISOString(),
+    min_clean_extraction_filter: state.minOcclusionFilter,
+    tomo_id: currentTomoId(),
+    particle_count: visible.length,
+    files
+  };
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${currentTomoId()}_clean_picks_${state.minOcclusionFilter.toFixed(2)}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function rotationMatrixFromOpenDirection(openDir) {
+  const zAxis = openDirectionGraphVector({ openDirection: openDir });
+  const up = Math.abs(zAxis.y) < 0.99 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+  const xAxis = new THREE.Vector3().crossVectors(up, zAxis).normalize();
+  const yAxis = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+  return [
+    [xAxis.x, yAxis.x, zAxis.x, 0],
+    [xAxis.y, yAxis.y, zAxis.y, 0],
+    [xAxis.z, yAxis.z, zAxis.z, 0],
+    [0, 0, 0, 1]
+  ];
+}
+
+function openDirectionGraphVector(detection) {
+  const d = detection?.openDirection;
+  if (!d || !Number.isFinite(d.x)) {
+    return new THREE.Vector3(0, 1, 0);
+  }
+  return new THREE.Vector3(d.x, d.y, d.z).normalize();
+}
+
+function formatOpenDirectionLabel(openDir) {
+  if (!openDir || !Number.isFinite(openDir.x)) {
+    return "—";
+  }
+  return `(${openDir.x.toFixed(2)}, ${openDir.y.toFixed(2)}, ${openDir.z.toFixed(2)})`;
+}
+
+let hemisphereFetchId = 0;
+
+async function fetchHemisphereForPick(detection) {
+  if (!detection?.id || !state.detections.length) {
+    return null;
+  }
+  const reqId = ++hemisphereFetchId;
+  try {
+    const payload = await fetchJson("/api/graph/hemisphere", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pickId: detection.id,
+        tomoId: currentTomoId(),
+        detections: state.detections
+      })
+    });
+    if (reqId !== hemisphereFetchId) {
+      return null;
+    }
+    return payload;
+  } catch (error) {
+    console.warn("Hemisphere fetch failed:", error);
+    return null;
+  }
+}
+
+function renderHemisphereHeatmap(hemisphereData, shellRadius) {
+  clearGroup(hemisphereGroup);
+  if (!hemisphereData?.directions?.length) {
+    return;
+  }
+
+  const positions = [];
+  const colors = [];
+  hemisphereData.directions.forEach((dir, index) => {
+    const open = !hemisphereData.blocked[index];
+    positions.push(dir[0] * shellRadius, dir[1] * shellRadius, dir[2] * shellRadius);
+    if (open) {
+      colors.push(0.35, 0.88, 0.62);
+    } else {
+      colors.push(0.92, 0.35, 0.35);
+    }
+  });
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  hemisphereGroup.add(
+    new THREE.Points(
+      geometry,
+      new THREE.PointsMaterial({
+        size: shellRadius * 0.08,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.85,
+        depthWrite: false
+      })
+    )
+  );
+}
+
+function exposureColorRgb(exposure) {
+  const t = Math.max(0, Math.min(1, exposure ?? 0));
+  // purple (buried) -> teal (exposed)
+  const r = Math.round(110 + t * 60);
+  const g = Math.round(70 + t * 120);
+  const b = Math.round(180 - t * 70);
+  return [r, g, b];
+}
+
 function detectionColorArray(detection) {
+  if (state.overlayColorMode === "clean") {
+    const score = detectionStaScore(detection);
+    if (score !== null) {
+      return exposureColorRgb(score);
+    }
+  }
+  if (state.overlayColorMode === "exposure") {
+    const exposure = detectionExposureValue(detection);
+    if (exposure !== null) {
+      return exposureColorRgb(exposure);
+    }
+  }
+
   const fallback = [11, 127, 131];
   const hex = String(detection.color || "").replace("#", "");
   if (!/^[0-9a-f]{6}$/i.test(hex)) {
@@ -311,6 +1022,11 @@ function visibleSliceAxesForDetection(detection) {
 }
 
 function annotationWorldPosition(detection) {
+  const visibleAxes = visibleSliceAxesForDetection(detection);
+  if (visibleAxes.length > 0) {
+    return detectionSliceWorldPosition(detection, visibleAxes[0]);
+  }
+  return state.selectedDetection ? detectionWorldPosition(detection) : null;
   return detectionWorldPosition(detection);
 }
 
@@ -346,7 +1062,9 @@ function selectedAnnotationDetections() {
   }
 
   return state.detections
+    .filter((detection) => passesOcclusionFilter(detection))
     .filter((detection) => (detection.molecule || detection.type) === state.selectedMolecule)
+    .filter((detection) => visibleSliceAxesForDetection(detection).length > 0)
     .slice(0, annotationLimit);
 }
 
@@ -530,6 +1248,10 @@ function createColorizedSliceData(axis, bytes, width, height) {
 
   const sliceIndex = state.currentSlices[axis];
   state.detections.forEach((detection) => {
+    if (!passesOcclusionFilter(detection)) {
+      return;
+    }
+
     const projection = detectionSliceProjection(detection, axis, width, height);
     if (!projection) {
       return;
@@ -955,8 +1677,13 @@ function renderDetectionList() {
   elements.detectionList.replaceChildren();
   const groups = getMoleculeGroups();
   const totalPicks = state.detections.length;
-  elements.detectionCount.textContent = `${groups.length} type${groups.length !== 1 ? "s" : ""} · ${totalPicks} picks`;
+  const visibleCount = visibleDetections().length;
+  const filterActive = state.minOcclusionFilter > 0 && hasExposureData();
+  elements.detectionCount.textContent = filterActive
+    ? `${groups.length} type${groups.length !== 1 ? "s" : ""} · ${visibleCount}/${totalPicks} picks`
+    : `${groups.length} type${groups.length !== 1 ? "s" : ""} · ${totalPicks} picks`;
   elements.showAllBtn.hidden = state.selectedMolecule === null;
+  updateOcclusionFilterUI();
   elements.showAllBtn.textContent = state.labelsHidden ? "Show all" : "Hide all";
 
   groups.forEach((group) => {
@@ -995,9 +1722,10 @@ function renderDetectionList() {
     if (isExpanded) {
       const pickList = document.createElement("div");
       pickList.className = "molecule-pick-list";
-      group.picks.forEach((det) => {
+      sortedPicks(group.picks).forEach((det) => {
         const row = document.createElement("button");
-        row.className = `molecule-pick-row${det.id === state.selectedDetection?.id ? " is-selected" : ""}`;
+        const filteredOut = !passesOcclusionFilter(det);
+        row.className = `molecule-pick-row${det.id === state.selectedDetection?.id ? " is-selected" : ""}${filteredOut ? " is-filtered" : ""}`;
         row.type = "button";
         row.dataset.id = det.id;
         const dot = document.createElement("span");
@@ -1006,6 +1734,13 @@ function renderDetectionList() {
         const label = document.createElement("span");
         label.textContent = det.id;
         row.append(dot, label);
+        const staScore = detectionStaScore(det);
+        if (staScore !== null) {
+          const badge = document.createElement("span");
+          badge.className = `exposure-badge${filteredOut ? " is-below-threshold" : ""}`;
+          badge.textContent = staScore.toFixed(2);
+          row.append(badge);
+        }
         row.addEventListener("click", (e) => {
           e.stopPropagation();
           selectDetection(det.id);
@@ -1019,11 +1754,39 @@ function renderDetectionList() {
   });
 }
 
+function hasAnalysisContent(analysis) {
+  if (!analysis) {
+    return false;
+  }
+  const structured = analysis.structured;
+  const items = analysis.aggregation?.items;
+  const report = analysis.report || analysis.localSummary;
+  return Boolean(
+    structured ||
+    (Array.isArray(items) && items.length > 0) ||
+    report ||
+    analysis.reportError ||
+    analysis.reportErrorBody
+  );
+}
+
 function renderAnalysis(analysis) {
+  if (hasAnalysisContent(analysis)) {
+    state.datasetAnalysis = analysis;
+  }
+
+  const payload = state.datasetAnalysis;
+  if (!hasAnalysisContent(payload)) {
+    elements.analysisStatus.textContent = "Waiting for labels";
+    elements.analysisSummary.replaceChildren();
+    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.";
+    return;
+  }
+
   elements.analysisSummary.replaceChildren();
 
-  const structured = analysis?.structured || null;
-  const fallbackItems = analysis?.aggregation?.items || [];
+  const structured = payload.structured || null;
+  const fallbackItems = payload.aggregation?.items || [];
   const cards = Array.isArray(structured?.insights) && structured.insights.length > 0
     ? structured.insights
     : fallbackItems.map((item) => ({
@@ -1037,12 +1800,11 @@ function renderAnalysis(analysis) {
         ]
       }));
 
-  if (!cards.length && !structured) {
-    elements.analysisStatus.textContent = "Waiting for labels";
-    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.";
+  if (!cards.length && !structured && !(payload.report || payload.localSummary) && !payload.reportError) {
     return;
   }
 
+  elements.analysisStatus.textContent = payload.reportStatus || analysis?.reportStatus || "Ready";
   elements.analysisStatus.textContent = analysis.reportStatus || "Ready";
   elements.analysisStatus.classList.remove("active");
 
@@ -1102,6 +1864,7 @@ function renderAnalysis(analysis) {
     elements.analysisSummary.append(section);
   }
 
+  const report = payload.report || payload.localSummary || analysis?.report || analysis?.localSummary || "";
   // Report panel
   const report = analysis.report || analysis.localSummary || "";
   elements.analysisReport.replaceChildren();
@@ -1159,6 +1922,17 @@ function renderAnalysis(analysis) {
       elements.analysisReport.append(paragraph);
     });
   }
+  const reportWarning = payload.reportWarning || analysis?.reportWarning;
+  if (reportWarning) {
+    const warningEl = document.createElement("p");
+    warningEl.className = "analysis-warning";
+    warningEl.textContent = `⚠ ${reportWarning}`;
+    elements.analysisReport.append(warningEl);
+  }
+
+  const reportError = payload.reportError || analysis?.reportError;
+  const reportErrorBody = payload.reportErrorBody || analysis?.reportErrorBody;
+  if (reportError || reportErrorBody) {
   if (analysis.reportWarning) {
     const warningEl = document.createElement("p");
     warningEl.className = "analysis-warning";
@@ -1170,6 +1944,7 @@ function renderAnalysis(analysis) {
     heading.textContent = "Analysis Error";
     const errorBlock = document.createElement("pre");
     errorBlock.className = "analysis-error";
+    errorBlock.textContent = [reportError, reportErrorBody].filter(Boolean).join("\n\n");
     errorBlock.textContent = [analysis.reportError, analysis.reportErrorBody].filter(Boolean).join("\n\n");
     elements.analysisReport.append(heading, errorBlock);
   }
@@ -1186,11 +1961,37 @@ function showPickInfo(detection) {
   setInfoLabel(elements.selectedType, "Type");
   setInfoLabel(elements.selectedConfidence, "Confidence");
   setInfoLabel(elements.selectedPosition, "Position");
+  setInfoLabel(elements.selectedExposure, "Steric exposure");
+  setInfoLabel(elements.selectedCleanExtraction, "Clean extraction");
+  setInfoLabel(elements.selectedAnisotropy, "Anisotropy");
+  setInfoLabel(elements.selectedOpenDirection, "Open direction");
+  setInfoLabel(elements.selectedGnnExposure, "GNN exposure");
+  setInfoLabel(elements.selectedNeighbors, "Neighbors");
   setInfoLabel(elements.selectedNotes, "Notes");
   elements.selectedId.textContent = detection.id;
   elements.selectedType.textContent = detection.type;
   elements.selectedConfidence.textContent = detection.confidence;
   elements.selectedPosition.textContent = detection.position;
+  elements.selectedExposure.textContent = Number.isFinite(detection.stericExposure)
+    ? detection.stericExposure.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedCleanExtraction.textContent = Number.isFinite(detection.cleanExtractionScore)
+    ? detection.cleanExtractionScore.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedAnisotropy.textContent = Number.isFinite(detection.anisotropyIndex)
+    ? detection.anisotropyIndex.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedOpenDirection.textContent = detection.openDirection
+    ? formatOpenDirectionLabel(detection.openDirection)
+    : "Run crowding analysis";
+  elements.selectedGnnExposure.textContent = Number.isFinite(detection.gnnExposure)
+    ? detection.gnnExposure.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedNeighbors.textContent = Number.isFinite(detection.neighborCount)
+    ? `${detection.neighborCount} within cutoff`
+    : state.neighborMap.get(detection.id)?.length
+      ? `${state.neighborMap.get(detection.id).length} kNN`
+      : "Run crowding analysis";
   elements.selectedNotes.textContent = `${detection.notes} Render radius ${Math.round(moleculeRadiusAngstrom(detection))} angstrom.`;
 }
 
@@ -1216,11 +2017,13 @@ function selectMoleculeGroup(molecule) {
   if (group) {
     showMoleculeGroupInfo(group);
   }
+  renderGraphPanel(null);
   syncViewerAnnotations();
 }
 
 function clearMoleculeSelection() {
   state.selectedDetection = null;
+  renderGraphPanel(null);
   state.labelsHidden = !state.labelsHidden;
   syncViewerAnnotations();
   renderDetectionList();
@@ -1239,7 +2042,20 @@ function selectDetection(id) {
 
   focusSlicesOnDetection(detection);
   showPickInfo(detection);
+  renderGraphPanel(detection);
   syncViewerAnnotations();
+
+  if (detection.voxel && state.sliceShape) {
+    state.currentSlices.x = Math.max(0, Math.min(state.sliceShape.x - 1, Math.round(detection.voxel.x)));
+    state.currentSlices.y = Math.max(0, Math.min(state.sliceShape.y - 1, Math.round(detection.voxel.y)));
+    state.currentSlices.z = Math.max(0, Math.min(state.sliceShape.z - 1, Math.round(detection.voxel.z)));
+    sliceAxes.forEach((axis) => {
+      elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
+      elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
+    });
+    refreshSlicePreviews();
+  }
+
   renderDetectionList();
 }
 
@@ -1284,12 +2100,17 @@ function setCachedSlice(axis, index, maxSize, value) {
 async function loadScans() {
   setStatus("Finding scans", true);
   const payload = await fetchJson("/api/scans");
-  state.scans = payload.scans;
+  state.scans = [...payload.scans].sort((a, b) => {
+    if (Boolean(a.metadataMissing) === Boolean(b.metadataMissing)) {
+      return 0;
+    }
+    return a.metadataMissing ? 1 : -1;
+  });
   elements.scanSelect.replaceChildren(
     ...state.scans.map((scan) => {
       const option = document.createElement("option");
       option.value = scan.path;
-      option.textContent = scan.name;
+      option.textContent = scan.metadataMissing ? `${scan.name} (metadata missing)` : scan.name;
       option.disabled = scan.metadataMissing;
       return option;
     })
@@ -1297,12 +2118,18 @@ async function loadScans() {
 
   const firstUsableScan = state.scans.find((scan) => !scan.metadataMissing);
   if (!firstUsableScan) {
-    throw new Error("No sample or uploaded Zarr scans found");
+    state.selectedScan = null;
+    setStatus("Open a local .zarr path", false);
+    setProgress(0);
+    elements.message.hidden = false;
+    elements.message.textContent = "No readable Zarr scans found. Browser folder upload often skips hidden .zarray files — use the Local .zarr path field with the original folder.";
+    return false;
   }
 
   state.selectedScan = firstUsableScan.path;
   elements.scanSelect.value = state.selectedScan;
   syncLevelSelect();
+  return true;
 }
 
 function selectedScan() {
@@ -1356,6 +2183,14 @@ async function loadPreview() {
   state.selectedMolecule = null;
   state.labelsHidden = false;
   state.expandedMolecules.clear();
+  state.neighborMap.clear();
+  state.crowdingSummary = null;
+  state.datasetAnalysis = null;
+  renderExposureSummary(null);
+  renderGraphPanel(null);
+  renderGvi(null);
+  state.minOcclusionFilter = 0;
+  updateOcclusionFilterUI();
   state.currentSlices = {
     x: Math.floor(state.sliceShape.x / 2),
     y: Math.floor(state.sliceShape.y / 2),
@@ -1374,13 +2209,17 @@ async function loadPreview() {
     state.expandedMolecules.add(initialGroups[0].molecule);
   }
   syncViewerAnnotations();
+  syncPickOverlays();
   renderDetectionList();
   renderAnalysis(payload.analysis);
   if (state.detections.length > 0) {
     fetchClaudeAnalysis(state.selectedScan).catch(() => {});
   }
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
+  hideLoadingScreen();
+  elements.message.hidden = true;
   startSlicePrecache("Caching scan slices");
+  runGviAfterPicks().catch((error) => console.warn("GVI assessment failed:", error));
   setActiveSliceAxis("z");
   camera.position.set(1.55, 1.25, 1.65);
   controls.target.set(0, 0, 0);
@@ -1449,6 +2288,7 @@ async function precacheAllSlices(reason = "Caching slices") {
 
   for (const [batchIndex, batch] of batches.entries()) {
     if (runId !== precacheRunId) {
+      hideLoadingScreen();
       return;
     }
 
@@ -1476,6 +2316,7 @@ async function precacheAllSlices(reason = "Caching slices") {
   }
 
   if (runId !== precacheRunId) {
+    hideLoadingScreen();
     return;
   }
 
@@ -1620,11 +2461,14 @@ async function uploadZarrFolder() {
   }
 
   await loadScans();
-  if (payload.scans?.[0]?.path) {
-    state.selectedScan = payload.scans[0].path;
+  const uploaded = payload.scans?.find((scan) => !scan.metadataMissing);
+  if (uploaded?.path) {
+    state.selectedScan = uploaded.path;
     elements.scanSelect.value = state.selectedScan;
+    syncLevelSelect();
+  } else if (!state.selectedScan) {
+    throw new Error(payload.error || "Uploaded .zarr is missing metadata. Use the Local .zarr path field instead.");
   }
-  syncLevelSelect();
   await loadPreview();
 }
 
@@ -1657,6 +2501,12 @@ async function uploadLabelsFolder() {
   state.selectedMolecule = null;
   state.labelsHidden = false;
   state.expandedMolecules.clear();
+  state.neighborMap.clear();
+  state.crowdingSummary = null;
+  state.minOcclusionFilter = 0;
+  updateOcclusionFilterUI();
+  renderExposureSummary(null);
+  renderGraphPanel(null);
   const initialGroups = getMoleculeGroups();
   if (initialGroups.length > 0) {
     state.expandedMolecules.add(initialGroups[0].molecule);
@@ -1665,6 +2515,7 @@ async function uploadLabelsFolder() {
   sliceCache.clear();
   renderVolumeScene(state.volume);
   syncViewerAnnotations();
+  syncPickOverlays();
   renderDetectionList();
   renderAnalysis(payload.analysis);
   fetchClaudeAnalysis(state.selectedScan).catch(() => {});
@@ -1674,6 +2525,7 @@ async function uploadLabelsFolder() {
   elements.detectionCount.textContent = `${initialGroups.length} type${initialGroups.length !== 1 ? "s" : ""} · ${state.detections.length} picks`;
   setProgress(100);
   setStatus(`Loaded ${payload.jsonFiles} label files`, false);
+  await runGviAfterPicks();
 }
 
 async function openLocalZarrPath() {
@@ -1735,6 +2587,94 @@ async function openSelectedScanInSlicer() {
   }
 }
 
+async function runCrowdingAnalysis() {
+  if (!state.detections.length) {
+    showError(new Error("Load or infer picks before running crowding analysis."));
+    return;
+  }
+
+  elements.runCrowding.disabled = true;
+  elements.runCrowding.classList.add("is-running");
+  elements.runCrowding.innerHTML = '<span class="inference-icon">⏳</span> Analyzing…';
+  elements.crowdingProgress.hidden = false;
+  elements.crowdingProgressFill.style.width = "0%";
+  elements.crowdingStatus.textContent = "Starting crowding analysis…";
+
+  const jobId = `crowd-${Date.now()}`;
+
+  try {
+    const response = await fetch("/api/graph/crowding/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jobId,
+        tomoId: currentTomoId(),
+        detections: state.detections
+      })
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || "Failed to start crowding analysis");
+    }
+
+    const eventSource = new EventSource(`/api/graph/crowding/progress?jobId=${jobId}`);
+
+    eventSource.addEventListener("progress", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.percent >= 0) {
+          elements.crowdingProgressFill.style.width = `${data.percent}%`;
+        }
+        if (data.message) {
+          elements.crowdingStatus.textContent = data.message;
+        }
+      } catch {
+        // ignore
+      }
+    });
+
+    eventSource.addEventListener("complete", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        applyCrowdingResult(data);
+        elements.crowdingStatus.textContent = "✓ Crowding analysis complete";
+        elements.crowdingProgressFill.style.width = "100%";
+        elements.crowdingProgressFill.style.background = "#16743a";
+      } catch (error) {
+        showError(new Error("Failed to parse crowding results"));
+      }
+      resetCrowdingButton();
+      eventSource.close();
+    });
+
+    eventSource.addEventListener("error", (event) => {
+      let errorMsg = "Crowding analysis failed";
+      try {
+        const data = JSON.parse(event.data);
+        errorMsg = data.error || errorMsg;
+      } catch {
+        // ignore
+      }
+      showError(new Error(errorMsg));
+      resetCrowdingButton();
+      eventSource.close();
+    });
+  } catch (error) {
+    showError(error);
+    resetCrowdingButton();
+  }
+}
+
+function resetCrowdingButton() {
+  elements.runCrowding.disabled = state.detections.length === 0;
+  elements.runCrowding.classList.remove("is-running");
+  elements.runCrowding.innerHTML = '<span class="inference-icon">◎</span> Analyze Crowding';
+  setTimeout(() => {
+    elements.crowdingProgress.hidden = true;
+    elements.crowdingProgressFill.style.background = "";
+  }, 5000);
+}
+
 // ─── Inference (model prediction) ──────────────────────────────────────
 
 let inferenceScanId = null;
@@ -1743,6 +2683,15 @@ async function runInference() {
   if (!state.selectedScan) {
     showError(new Error("Select a scan first before running inference."));
     return;
+  }
+
+  if (shouldBlockInferenceForGvi()) {
+    const proceed = window.confirm(
+      `${state.gvi?.message || "Grid viability check failed."}\n\nRun inference anyway?`
+    );
+    if (!proceed) {
+      return;
+    }
   }
 
   // Disable button and show progress
@@ -1850,6 +2799,12 @@ function onInferenceComplete(data) {
     state.selectedMolecule = null;
     state.labelsHidden = false;
     state.expandedMolecules.clear();
+    state.neighborMap.clear();
+    state.crowdingSummary = null;
+    state.minOcclusionFilter = 0;
+    updateOcclusionFilterUI();
+    renderExposureSummary(null);
+    renderGraphPanel(null);
 
     const initialGroups = getMoleculeGroups();
     if (initialGroups.length > 0) {
@@ -1858,12 +2813,10 @@ function onInferenceComplete(data) {
 
     // Refresh the viewer
     sliceCache.clear();
-    if (state.vivActive) {
-      updateVivLayers();
-    } else {
-      renderVolumeScene(state.volume);
-    }
+    renderVolumeScene(state.volume);
     renderDetectionList();
+    syncPickOverlays();
+    syncViewerAnnotations();
     renderAnalysis(data.analysis || {});
     fetchClaudeAnalysis(state.selectedScan).catch(() => {});
     if (state.volume) {
@@ -1876,6 +2829,7 @@ function onInferenceComplete(data) {
     elements.inferenceStatus.textContent = `✓ ${data.numDetections} particles detected`;
     elements.inferenceProgressFill.style.width = "100%";
     elements.inferenceProgressFill.style.background = "#16743a";
+    runGviAfterPicks();
   }
 
   resetInferenceButton();
@@ -1900,6 +2854,33 @@ function animate() {
   controls.update();
   updateAnnotationPositions();
   renderer.render(scene, camera);
+  if (!elements.graphPanel.hidden) {
+    graphControls.update();
+    graphRenderer.render(graphScene, graphCamera);
+  }
+}
+
+async function fetchClaudeAnalysis(scanPath) {
+  if (!scanPath) {
+    return;
+  }
+  analysisRequestScan = scanPath;
+  elements.analysisStatus.textContent = "Generating AI analysis...";
+  elements.analysisStatus.classList.add("active");
+  try {
+    const result = await fetchJson("/api/analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ zarrPath: scanPath })
+    });
+    if (analysisRequestScan === scanPath) {
+      renderAnalysis(result);
+    }
+  } catch {
+    if (analysisRequestScan === scanPath) {
+      elements.analysisStatus.classList.remove("active");
+    }
+  }
 }
 
 async function fetchClaudeAnalysis(scanPath) {
@@ -1936,8 +2917,29 @@ elements.pointLimit.addEventListener("change", () => loadPreview().catch(showErr
 elements.upload.addEventListener("change", () => uploadZarrFolder().catch(showError));
 elements.labelsUpload.addEventListener("change", () => uploadLabelsFolder().catch(showError));
 elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch(showError));
+elements.resetCamera.addEventListener("click", () => {
+  camera.position.set(1.55, 1.25, 1.65);
+  controls.target.set(0, 0, 0);
+  controls.update();
+});
+elements.resetGraphCamera.addEventListener("click", () => {
+  if (state.selectedDetection) {
+    renderGraphPanel(state.selectedDetection);
+    return;
+  }
+  frameGraphCamera(0.35);
+});
 elements.showAllBtn.addEventListener("click", clearMoleculeSelection);
 elements.runInference.addEventListener("click", () => runInference().catch(showError));
+elements.runCrowding.addEventListener("click", () => runCrowdingAnalysis().catch(showError));
+elements.overlayColorMode.addEventListener("change", () => {
+  state.overlayColorMode = elements.overlayColorMode.value;
+  refreshSlicePreviews();
+  syncPickOverlays();
+  syncViewerAnnotations();
+});
+elements.occlusionFilterSlider?.addEventListener("input", applyOcclusionFilter);
+elements.exportCleanPicks?.addEventListener("click", exportCleanCopickPicks);
 sliceAxes.forEach((axis) => {
   elements.sliceSliders[axis].addEventListener("input", () => {
     if (!state.volume) {
@@ -1947,12 +2949,19 @@ sliceAxes.forEach((axis) => {
     setSliceSliderValue(axis);
     setActiveSliceAxis(axis);
     updateSliceSeams();
-    updateAnnotationPositions();
+    if (state.selectedMolecule && !state.selectedDetection) {
+      syncViewerAnnotations();
+    } else {
+      updateAnnotationPositions();
+    }
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });
 });
-window.addEventListener("resize", resizeViewer);
+window.addEventListener("resize", () => {
+  resizeViewer();
+  resizeGraphViewer();
+});
 
 function showError(error) {
   setStatus("Error", false);
@@ -1968,5 +2977,5 @@ resizeViewer();
 animate();
 
 loadScans()
-  .then(loadPreview)
+  .then((hasScan) => (hasScan ? loadPreview() : undefined))
   .catch(showError);
