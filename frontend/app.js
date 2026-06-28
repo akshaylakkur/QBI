@@ -11,6 +11,7 @@ const state = {
   detections: [],
   selectedDetection: null,
   selectedMolecule: null,
+  labelsHidden: false,
   expandedMolecules: new Set(),
   currentSlices: { x: 0, y: 0, z: 0 },
   activeSliceAxis: "z",
@@ -107,7 +108,6 @@ const elements = {
     y: document.querySelector("#y-slice-label"),
     z: document.querySelector("#z-slice-label")
   },
-  resetCamera: document.querySelector("#reset-camera"),
   sliceSliders: {
     x: document.querySelector("#x-slice-slider"),
     y: document.querySelector("#y-slice-slider"),
@@ -1027,6 +1027,7 @@ function annotationWorldPosition(detection) {
     return detectionSliceWorldPosition(detection, visibleAxes[0]);
   }
   return state.selectedDetection ? detectionWorldPosition(detection) : null;
+  return detectionWorldPosition(detection);
 }
 
 function projectedViewerPosition(detection) {
@@ -1050,6 +1051,9 @@ function projectedViewerPosition(detection) {
 }
 
 function selectedAnnotationDetections() {
+  if (state.labelsHidden) {
+    return [];
+  }
   if (state.selectedDetection) {
     return [state.selectedDetection];
   }
@@ -1680,6 +1684,7 @@ function renderDetectionList() {
     : `${groups.length} type${groups.length !== 1 ? "s" : ""} · ${totalPicks} picks`;
   elements.showAllBtn.hidden = state.selectedMolecule === null;
   updateOcclusionFilterUI();
+  elements.showAllBtn.textContent = state.labelsHidden ? "Show all" : "Hide all";
 
   groups.forEach((group) => {
     const isSelected = state.selectedMolecule === group.molecule;
@@ -1800,6 +1805,7 @@ function renderAnalysis(analysis) {
   }
 
   elements.analysisStatus.textContent = payload.reportStatus || analysis?.reportStatus || "Ready";
+  elements.analysisStatus.textContent = analysis.reportStatus || "Ready";
   elements.analysisStatus.classList.remove("active");
 
   // Keywords pills
@@ -1859,6 +1865,8 @@ function renderAnalysis(analysis) {
   }
 
   const report = payload.report || payload.localSummary || analysis?.report || analysis?.localSummary || "";
+  // Report panel
+  const report = analysis.report || analysis.localSummary || "";
   elements.analysisReport.replaceChildren();
   if (structured?.title) {
     const heading = document.createElement("h3");
@@ -1925,11 +1933,19 @@ function renderAnalysis(analysis) {
   const reportError = payload.reportError || analysis?.reportError;
   const reportErrorBody = payload.reportErrorBody || analysis?.reportErrorBody;
   if (reportError || reportErrorBody) {
+  if (analysis.reportWarning) {
+    const warningEl = document.createElement("p");
+    warningEl.className = "analysis-warning";
+    warningEl.textContent = `⚠ ${analysis.reportWarning}`;
+    elements.analysisReport.append(warningEl);
+  }
+  if (analysis.reportError || analysis.reportErrorBody) {
     const heading = document.createElement("h3");
     heading.textContent = "Analysis Error";
     const errorBlock = document.createElement("pre");
     errorBlock.className = "analysis-error";
     errorBlock.textContent = [reportError, reportErrorBody].filter(Boolean).join("\n\n");
+    errorBlock.textContent = [analysis.reportError, analysis.reportErrorBody].filter(Boolean).join("\n\n");
     elements.analysisReport.append(heading, errorBlock);
   }
 }
@@ -1995,6 +2011,7 @@ function showMoleculeGroupInfo(group) {
 function selectMoleculeGroup(molecule) {
   state.selectedMolecule = molecule;
   state.selectedDetection = null;
+  state.labelsHidden = false;
 
   const group = getMoleculeGroups().find((g) => g.molecule === molecule);
   if (group) {
@@ -2005,9 +2022,9 @@ function selectMoleculeGroup(molecule) {
 }
 
 function clearMoleculeSelection() {
-  state.selectedMolecule = null;
   state.selectedDetection = null;
   renderGraphPanel(null);
+  state.labelsHidden = !state.labelsHidden;
   syncViewerAnnotations();
   renderDetectionList();
 }
@@ -2020,6 +2037,7 @@ function selectDetection(id) {
 
   state.selectedDetection = detection;
   state.selectedMolecule = detection.molecule || detection.type;
+  state.labelsHidden = false;
   state.expandedMolecules.add(state.selectedMolecule);
 
   focusSlicesOnDetection(detection);
@@ -2163,6 +2181,7 @@ async function loadPreview() {
   refreshAnnotationNumbers();
   state.selectedDetection = null;
   state.selectedMolecule = null;
+  state.labelsHidden = false;
   state.expandedMolecules.clear();
   state.neighborMap.clear();
   state.crowdingSummary = null;
@@ -2480,6 +2499,7 @@ async function uploadLabelsFolder() {
   refreshAnnotationNumbers();
   state.selectedDetection = null;
   state.selectedMolecule = null;
+  state.labelsHidden = false;
   state.expandedMolecules.clear();
   state.neighborMap.clear();
   state.crowdingSummary = null;
@@ -2777,6 +2797,7 @@ function onInferenceComplete(data) {
     refreshAnnotationNumbers();
     state.selectedDetection = null;
     state.selectedMolecule = null;
+    state.labelsHidden = false;
     state.expandedMolecules.clear();
     state.neighborMap.clear();
     state.crowdingSummary = null;
@@ -2836,6 +2857,29 @@ function animate() {
   if (!elements.graphPanel.hidden) {
     graphControls.update();
     graphRenderer.render(graphScene, graphCamera);
+  }
+}
+
+async function fetchClaudeAnalysis(scanPath) {
+  if (!scanPath) {
+    return;
+  }
+  analysisRequestScan = scanPath;
+  elements.analysisStatus.textContent = "Generating AI analysis...";
+  elements.analysisStatus.classList.add("active");
+  try {
+    const result = await fetchJson("/api/analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ zarrPath: scanPath })
+    });
+    if (analysisRequestScan === scanPath) {
+      renderAnalysis(result);
+    }
+  } catch {
+    if (analysisRequestScan === scanPath) {
+      elements.analysisStatus.classList.remove("active");
+    }
   }
 }
 

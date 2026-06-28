@@ -164,6 +164,18 @@ h2 {
   padding: 0;
 }
 
+.app-logo {
+  height: 38px;
+  width: auto;
+  display: block;
+}
+
+h2 {
+  color: #1e293b;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
 .slice-toolbar {
   flex: 1;
   min-width: min(100%, 620px);
@@ -1442,14 +1454,6 @@ canvas.slice-preview {
     position: static;
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .header-actions {
-    width: 100%;
-  }
-
-  .primary-action {
-    flex: 1;
   }
 
   .workspace {
