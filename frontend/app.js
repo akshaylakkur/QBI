@@ -429,11 +429,19 @@ function getDetectionPhysical(detection) {
   };
 }
 
+function cryoDirectionToGraphVector(dx, dy, dz) {
+  const v = new THREE.Vector3(dx, dz, -dy);
+  return v.lengthSq() > 0 ? v.normalize() : v;
+}
+
 function graphPositionFromPhysical(physical, origin) {
-  return new THREE.Vector3(
-    (physical.x - origin.x) * GRAPH_SCALE,
-    (physical.z - origin.z) * GRAPH_SCALE,
-    -((physical.y - origin.y) * GRAPH_SCALE)
+  const delta = {
+    x: (physical.x - origin.x) * GRAPH_SCALE,
+    y: (physical.y - origin.y) * GRAPH_SCALE,
+    z: (physical.z - origin.z) * GRAPH_SCALE
+  };
+  return cryoDirectionToGraphVector(delta.x, delta.y, delta.z).multiplyScalar(
+    Math.hypot(delta.x, delta.y, delta.z)
   );
 }
 
@@ -853,7 +861,8 @@ function renderHemisphereHeatmap(hemisphereData, shellRadius) {
   const colors = [];
   hemisphereData.directions.forEach((dir, index) => {
     const open = !hemisphereData.blocked[index];
-    positions.push(dir[0] * shellRadius, dir[1] * shellRadius, dir[2] * shellRadius);
+    const graphDir = cryoDirectionToGraphVector(dir[0], dir[1], dir[2]);
+    positions.push(graphDir.x * shellRadius, graphDir.y * shellRadius, graphDir.z * shellRadius);
     if (open) {
       colors.push(0.35, 0.88, 0.62);
     } else {
