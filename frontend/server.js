@@ -1906,6 +1906,33 @@ async function handleApi(req, res) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/graph/hemisphere") {
+    try {
+      const body = await readRequestJson(req);
+      const detections = Array.isArray(body.detections) ? body.detections : [];
+      if (detections.length === 0) {
+        sendJson(res, 400, { error: "No picks available for hemisphere query" });
+        return;
+      }
+      const pickId = body.pickId || body.pick_id;
+      if (!pickId) {
+        sendJson(res, 400, { error: "pickId required" });
+        return;
+      }
+      const result = await runGraphApi({
+        mode: "hemisphere",
+        tomo_id: body.tomoId || "scan",
+        pick_id: pickId,
+        detections: slimDetectionsForGraph(detections),
+        n_rays: body.nRays || 2000
+      });
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, { error: error.message || String(error) });
+    }
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/graph/gvi") {
     try {
       const body = await readRequestJson(req);
@@ -2002,7 +2029,7 @@ async function handleApi(req, res) {
           mode: "crowding",
           tomo_id: body.tomoId || "scan",
           detections: slimDetectionsForGraph(detections),
-          n_rays: body.nRays || 200,
+          n_rays: body.nRays || 2000,
           checkpoint: body.checkpoint || defaultGnnCheckpoint
         },
         emitter

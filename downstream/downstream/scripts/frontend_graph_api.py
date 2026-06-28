@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from downstream.constants import RADIUS_ANGSTROM
-from downstream.geometry.exposure import steric_exposure_batch
+from downstream.geometry.exposure import steric_exposure_batch, steric_exposure_one
 from downstream.gnn.features import EDGE_DIM, FeatureStats, build_edges
 from downstream.gnn.graph import build_graph_from_arrays
 from downstream.gnn.model import ExposureGNN
@@ -22,6 +22,7 @@ from downstream.qa.grid_viability import GridViabilityConfig, assess_cloud
 from downstream.types import ExposureConfig, ParticleCloud
 
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parents[3] / "runs" / "exposure_gnn.pt"
+DEFAULT_N_RAYS = 2000
 
 
 def _emit_progress(fraction: float, message: str) -> None:
@@ -67,10 +68,54 @@ def cloud_from_detections(tomo_id: str, detections: List[dict]) -> ParticleCloud
     return cloud
 
 
+def _pick_index(cloud: ParticleCloud, pick_id: str) -> int:
+    pick_ids: List[str] = list(getattr(cloud, "pick_ids", []))
+    if pick_id not in pick_ids:
+        raise ValueError(f"Pick id {pick_id!r} not found in cloud")
+    return pick_ids.index(pick_id)
+
+
+def _open_direction_dict(vec: np.ndarray) -> dict:
+    v = np.asarray(vec, dtype=np.float64).reshape(3)
+    return {"x": round(float(v[0]), 6), "y": round(float(v[1]), 6), "z": round(float(v[2]), 6)}
+
+
+def _exposure_fields(res) -> dict:
+    return {
+        "stericExposure": round(float(res.steric_exposure), 4),
+        "anisotropyIndex": round(float(res.anisotropy_index), 4),
+        "cleanExtractionScore": round(float(res.clean_extraction_score), 4),
+        "openDirection": _open_direction_dict(res.open_direction),
+        "cleanConeHalfAngleDeg": round(float(res.clean_cone_half_angle_deg), 2),
+        "nOpenComponents": int(res.n_open_components),
+    }
+
+
 def run_gvi(cloud: ParticleCloud, mean_exposure: Optional[float] = None) -> dict:
     config = GridViabilityConfig()
     result = assess_cloud(cloud, config=config, reference=None, mean_exposure=mean_exposure)
     return result.to_dict()
+
+
+def run_hemisphere(
+    cloud: ParticleCloud,
+    pick_id: str,
+    n_rays: int = DEFAULT_N_RAYS,
+) -> dict:
+    idx = _pick_index(cloud, pick_id)
+    config = ExposureConfig(n_rays=n_rays)
+    res = steric_exposure_one(cloud, idx, config=config)
+    directions = res.directions
+    blocked = res.blocked
+    if directions is None or blocked is None:
+        raise ValueError("Hemisphere data unavailable for pick")
+
+    return {
+        "pickId": pick_id,
+        "directions": directions.astype(float).tolist(),
+        "blocked": blocked.astype(bool).tolist(),
+        **_exposure_fields(res),
+    }
 
 
 def _knn_neighbor_ids(
@@ -78,15 +123,13 @@ def _knn_neighbor_ids(
     edge_cutoff: float = 500.0,
     knn_k: int = 12,
 ) -> Dict[str, List[dict]]:
-    """Map pick id -> list of neighbor summaries (kNN within graph builder)."""
     coords = cloud.coords
     radii = cloud.radii
     n = len(coords)
     pick_ids: List[str] = list(getattr(cloud, "pick_ids", [str(i) for i in range(n)]))
 
-    edge_index, edge_attr = build_edges(coords, radii, edge_cutoff=edge_cutoff, knn_k=knn_k)
+    edge_index, _edge_attr = build_edges(coords, radii, edge_cutoff=edge_cutoff, knn_k=knn_k)
 
-    # Build adjacency from directed edges; keep kNN-like neighbors per node
     neighbors: Dict[int, List[tuple[int, float]]] = {i: [] for i in range(n)}
     if edge_index.shape[1] > 0:
         for e in range(edge_index.shape[1]):
@@ -124,19 +167,21 @@ def _knn_neighbor_ids(
 def run_crowding(
     cloud: ParticleCloud,
     checkpoint_path: Path,
-    n_rays: int = 200,
+    n_rays: int = DEFAULT_N_RAYS,
 ) -> dict:
-    _emit_progress(0.05, "Computing steric exposure…")
+    _emit_progress(0.05, f"Computing steric exposure ({n_rays} rays)…")
     config = ExposureConfig(n_rays=n_rays)
     indices = np.arange(cloud.n_particles, dtype=np.int64)
     exposure_results = steric_exposure_batch(cloud, config=config, target_indices=indices)
     exposure = np.array([r.steric_exposure for r in exposure_results], dtype=np.float32)
+    clean_scores = np.array([r.clean_extraction_score for r in exposure_results], dtype=np.float32)
     neighbor_counts = np.array(
         [r.n_neighbors_considered for r in exposure_results], dtype=np.int32,
     )
 
     pick_ids: List[str] = list(getattr(cloud, "pick_ids", []))
     mean_exposure = float(exposure.mean()) if exposure.size else None
+    mean_clean = float(clean_scores.mean()) if clean_scores.size else None
 
     _emit_progress(0.45, "Running GNN exposure prediction…")
     gnn_exposure = exposure.copy()
@@ -176,45 +221,54 @@ def run_crowding(
         _emit_progress(0.45, f"GNN checkpoint not found at {ckpt_path}; using geometry only")
 
     _emit_progress(0.75, "Building neighbor graph…")
-    edge_cutoff = 500.0
-    knn_k = 12
-    neighbor_map = _knn_neighbor_ids(cloud, edge_cutoff=edge_cutoff, knn_k=knn_k)
+    neighbor_map = _knn_neighbor_ids(cloud, edge_cutoff=500.0, knn_k=12)
 
     _emit_progress(0.9, "Summarizing…")
     gvi = run_gvi(cloud, mean_exposure=mean_exposure)
 
-    by_type: Dict[str, List[float]] = {}
-    for t, exp in zip(cloud.types, exposure):
-        by_type.setdefault(t, []).append(float(exp))
+    by_type: Dict[str, dict] = {}
+    for i, ptype in enumerate(cloud.types):
+        entry = by_type.setdefault(
+            ptype,
+            {"exposures": [], "cleanScores": [], "anisotropies": []},
+        )
+        entry["exposures"].append(float(exposure[i]))
+        entry["cleanScores"].append(float(clean_scores[i]))
+        entry["anisotropies"].append(float(exposure_results[i].anisotropy_index))
 
-    occluded_threshold = 0.2
-    occluded_count = int((exposure < occluded_threshold).sum())
-    p10 = float(np.percentile(exposure, 10)) if exposure.size else 0.0
-    p90 = float(np.percentile(exposure, 90)) if exposure.size else 0.0
+    p10_exp = float(np.percentile(exposure, 10)) if exposure.size else 0.0
+    p90_exp = float(np.percentile(exposure, 90)) if exposure.size else 0.0
+    p10_clean = float(np.percentile(clean_scores, 10)) if clean_scores.size else 0.0
+    p90_clean = float(np.percentile(clean_scores, 90)) if clean_scores.size else 0.0
 
     enriched = []
     for i, pid in enumerate(pick_ids):
+        res = exposure_results[i]
         enriched.append(
             {
                 "id": pid,
-                "stericExposure": round(float(exposure[i]), 4),
                 "gnnExposure": round(float(gnn_exposure[i]), 4),
                 "neighborCount": int(neighbor_counts[i]),
                 "neighbors": neighbor_map.get(pid, []),
+                **_exposure_fields(res),
             }
         )
 
     summary = {
         "particleCount": cloud.n_particles,
+        "nRays": n_rays,
         "meanExposure": round(mean_exposure or 0.0, 4),
-        "p10Exposure": round(p10, 4),
-        "p90Exposure": round(p90, 4),
-        "occludedCount": occluded_count,
-        "occludedFraction": round(occluded_count / max(1, cloud.n_particles), 4),
+        "p10Exposure": round(p10_exp, 4),
+        "p90Exposure": round(p90_exp, 4),
+        "meanCleanExtraction": round(mean_clean or 0.0, 4),
+        "p10CleanExtraction": round(p10_clean, 4),
+        "p90CleanExtraction": round(p90_clean, 4),
         "byType": {
             t: {
-                "count": len(vals),
-                "meanExposure": round(float(np.mean(vals)), 4),
+                "count": len(vals["exposures"]),
+                "meanExposure": round(float(np.mean(vals["exposures"])), 4),
+                "meanCleanExtraction": round(float(np.mean(vals["cleanScores"])), 4),
+                "meanAnisotropy": round(float(np.mean(vals["anisotropies"])), 4),
             }
             for t, vals in sorted(by_type.items())
         },
@@ -243,6 +297,7 @@ def main() -> None:
     mode = payload.get("mode", "gvi")
     tomo_id = payload.get("tomo_id") or "scan"
     detections = payload.get("detections") or []
+    n_rays = int(payload.get("n_rays", DEFAULT_N_RAYS))
 
     cloud = cloud_from_detections(tomo_id, detections)
 
@@ -250,8 +305,12 @@ def main() -> None:
         result = {"gvi": run_gvi(cloud)}
     elif mode == "crowding":
         checkpoint = Path(payload.get("checkpoint") or DEFAULT_CHECKPOINT)
-        n_rays = int(payload.get("n_rays", 200))
         result = run_crowding(cloud, checkpoint, n_rays=n_rays)
+    elif mode == "hemisphere":
+        pick_id = payload.get("pick_id") or payload.get("pickId")
+        if not pick_id:
+            raise ValueError("pick_id required for hemisphere mode")
+        result = run_hemisphere(cloud, str(pick_id), n_rays=n_rays)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 

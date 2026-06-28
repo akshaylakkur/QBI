@@ -55,7 +55,7 @@ def generate_packing(
 
 def generate_synthetic_corpus(
     target_nodes: int = 50_000,
-    n_rays: int = 200,
+    n_rays: int = 2000,
     seed: int = 0,
     min_per_graph: int = 40,
     max_per_graph: int = 250,

@@ -12,7 +12,7 @@ def main():
     ap.add_argument("--labels", default="/Users/kjaladi/Desktop/QBI/runs/exposure_labels_2000rays.csv")
     ap.add_argument("--out", default="/Users/kjaladi/Desktop/QBI/runs/exposure_gnn.pt")
     ap.add_argument("--synthetic-nodes", type=int, default=50_000)
-    ap.add_argument("--synthetic-rays", type=int, default=200)
+    ap.add_argument("--synthetic-rays", type=int, default=2000)
     ap.add_argument("--pretrain-epochs", type=int, default=60)
     ap.add_argument("--finetune-epochs", type=int, default=120)
     args = ap.parse_args()

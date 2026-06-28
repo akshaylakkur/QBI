@@ -61,6 +61,13 @@ def clouds_to_dataframe(
                 "z": cloud.coords[i, 2],
                 "radius_angstrom": cloud.radii[i],
                 "steric_exposure": res.steric_exposure,
+                "anisotropy_index": res.anisotropy_index,
+                "clean_extraction_score": res.clean_extraction_score,
+                "open_dir_x": float(res.open_direction[0]),
+                "open_dir_y": float(res.open_direction[1]),
+                "open_dir_z": float(res.open_direction[2]),
+                "clean_cone_half_angle_deg": res.clean_cone_half_angle_deg,
+                "n_open_components": res.n_open_components,
                 "n_rays": res.n_rays,
                 "n_neighbors_considered": res.n_neighbors_considered,
             }
@@ -133,7 +140,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     ap.add_argument("--tomo-id", action="append", default=None, help="Filter tomogram(s)")
     ap.add_argument("--target-type", default=None, help="Filter particle type for exposure")
-    ap.add_argument("--n-rays", type=int, default=1000)
+    ap.add_argument("--n-rays", type=int, default=2000)
     ap.add_argument("--fast", action="store_true", help="Use 100 rays (smoke test)")
     ap.add_argument("--probe-radius", type=float, default=5.0)
     ap.add_argument("--surface-epsilon", type=float, default=2.0)

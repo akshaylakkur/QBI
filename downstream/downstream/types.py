@@ -14,10 +14,11 @@ from .constants import radius_for_type
 class ExposureConfig:
     """Parameters for Monte Carlo steric exposure raycasting."""
 
-    n_rays: int = 1000
+    n_rays: int = 2000
     probe_radius: float = 5.0
     surface_epsilon: float = 2.0
     neighbor_margin: float = 0.0
+    connectivity_epsilon: float = 1.08
 
 
 @dataclass
@@ -70,6 +71,15 @@ class ExposureResult:
     n_rays: int
     n_neighbors_considered: int
     n_rays_blocked: int = 0
+    open_direction: np.ndarray = field(
+        default_factory=lambda: np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    )
+    anisotropy_index: float = 0.0
+    clean_extraction_score: float = 1.0
+    n_open_components: int = 1
+    clean_cone_half_angle_deg: float = 0.0
+    blocked: Optional[np.ndarray] = None
+    directions: Optional[np.ndarray] = None
 
     @property
     def blocked_fraction(self) -> float:

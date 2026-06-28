@@ -79,6 +79,7 @@
               Overlay color
               <select id="overlay-color-mode">
                 <option value="type" selected>By molecule type</option>
+                <option value="clean">By clean extraction</option>
                 <option value="exposure">By steric exposure</option>
               </select>
             </label>
@@ -229,7 +230,7 @@
             </div>
             <div id="occlusion-filter-panel" class="occlusion-filter-panel" hidden>
               <label class="occlusion-filter-label" for="occlusion-filter-slider">
-                <span>Minimum Ambient Occlusion Filter</span>
+                <span>Clean extraction filter</span>
                 <strong id="occlusion-filter-value">0.00</strong>
               </label>
               <input id="occlusion-filter-slider" type="range" min="0" max="100" value="0" step="1" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
@@ -273,6 +274,18 @@
                 <div>
                   <dt>Steric exposure</dt>
                   <dd id="selected-exposure">-</dd>
+                </div>
+                <div>
+                  <dt>Clean extraction</dt>
+                  <dd id="selected-clean-extraction">-</dd>
+                </div>
+                <div>
+                  <dt>Anisotropy</dt>
+                  <dd id="selected-anisotropy">-</dd>
+                </div>
+                <div>
+                  <dt>Open direction</dt>
+                  <dd id="selected-open-direction">-</dd>
                 </div>
                 <div>
                   <dt>GNN exposure</dt>

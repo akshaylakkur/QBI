@@ -8,7 +8,8 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from ..types import ExposureConfig, ExposureResult, ParticleCloud
-from .directions import fibonacci_directions
+from .directions import fibonacci_directions, fibonacci_ray_adjacency
+from .hemisphere import analyze_hemisphere
 
 
 def _neighbor_cutoff_radius(cloud: ParticleCloud, target_index: int, config: ExposureConfig) -> float:
@@ -18,8 +19,6 @@ def _neighbor_cutoff_radius(cloud: ParticleCloud, target_index: int, config: Exp
     if cloud.n_particles <= 1:
         return cloud.radii[target_index] + max_r + config.neighbor_margin
 
-    # Upper bound on how far apart centers can be while still allowing occlusion
-    # along some forward ray from the target surface.
     dists = np.linalg.norm(coords - coords[target_index], axis=1)
     l_max = float(np.max(dists))
     return cloud.radii[target_index] + max_r + l_max + config.neighbor_margin
@@ -42,24 +41,11 @@ def rays_blocked_by_neighbors(
     neighbor_centers: np.ndarray,
     neighbor_radii_eff: np.ndarray,
 ) -> np.ndarray:
-    """Return boolean mask ``(M,)`` — True if ray is blocked by any neighbor.
-
-    Parameters
-    ----------
-    origin:
-        ``(M, 3)`` ray origins (one per direction, on target surface).
-    directions:
-        ``(M, 3)`` unit direction vectors.
-    neighbor_centers:
-        ``(K, 3)`` neighbor sphere centers.
-    neighbor_radii_eff:
-        ``(K,)`` effective neighbor radii (includes probe inflation).
-    """
+    """Return boolean mask ``(M,)`` — True if ray is blocked by any neighbor."""
     m = directions.shape[0]
     if neighbor_centers.size == 0:
         return np.zeros(m, dtype=bool)
 
-    # v[k, m, :] = neighbor_center[k] - origin[m]
     v = neighbor_centers[:, None, :] - origin[None, :, :]
     t0 = np.einsum("kmd,md->km", v, directions)
     perp = v - t0[:, :, None] * directions[None, :, :]
@@ -76,6 +62,7 @@ def steric_exposure_one(
     config: Optional[ExposureConfig] = None,
     directions: Optional[np.ndarray] = None,
     tree: Optional[cKDTree] = None,
+    edge_pairs: Optional[np.ndarray] = None,
 ) -> ExposureResult:
     """Compute steric exposure for a single particle in ``cloud``."""
     config = config or ExposureConfig()
@@ -83,6 +70,11 @@ def steric_exposure_one(
         directions = fibonacci_directions(config.n_rays)
     elif directions.shape[0] != config.n_rays:
         config.n_rays = directions.shape[0]
+
+    if edge_pairs is None:
+        edge_pairs, _ = fibonacci_ray_adjacency(
+            config.n_rays, epsilon=config.connectivity_epsilon
+        )
 
     if tree is None:
         tree = cKDTree(cloud.coords)
@@ -93,12 +85,25 @@ def steric_exposure_one(
 
     neighbor_idxs = _candidate_neighbors(tree, cloud, target_index, config)
     if neighbor_idxs.size == 0:
+        metrics = analyze_hemisphere(
+            directions,
+            np.zeros(config.n_rays, dtype=bool),
+            edge_pairs,
+            config.n_rays,
+        )
         return ExposureResult(
             index=target_index,
-            steric_exposure=1.0,
+            steric_exposure=metrics.steric_exposure,
             n_rays=config.n_rays,
             n_neighbors_considered=0,
             n_rays_blocked=0,
+            open_direction=metrics.open_direction,
+            anisotropy_index=metrics.anisotropy_index,
+            clean_extraction_score=metrics.clean_extraction_score,
+            n_open_components=metrics.n_open_components,
+            clean_cone_half_angle_deg=metrics.clean_cone_half_angle_deg,
+            blocked=np.zeros(config.n_rays, dtype=bool),
+            directions=directions,
         )
 
     neighbor_centers = cloud.coords[neighbor_idxs]
@@ -108,14 +113,21 @@ def steric_exposure_one(
         origins, directions, neighbor_centers, neighbor_radii_eff
     )
     n_blocked = int(blocked.sum())
-    exposure = 1.0 - (n_blocked / config.n_rays)
+    metrics = analyze_hemisphere(directions, blocked, edge_pairs, config.n_rays)
 
     return ExposureResult(
         index=target_index,
-        steric_exposure=float(exposure),
+        steric_exposure=metrics.steric_exposure,
         n_rays=config.n_rays,
         n_neighbors_considered=int(neighbor_idxs.size),
         n_rays_blocked=n_blocked,
+        open_direction=metrics.open_direction,
+        anisotropy_index=metrics.anisotropy_index,
+        clean_extraction_score=metrics.clean_extraction_score,
+        n_open_components=metrics.n_open_components,
+        clean_cone_half_angle_deg=metrics.clean_cone_half_angle_deg,
+        blocked=blocked.copy(),
+        directions=directions,
     )
 
 
@@ -127,6 +139,9 @@ def steric_exposure_batch(
     """Compute steric exposure for all (or selected) particles in ``cloud``."""
     config = config or ExposureConfig()
     directions = fibonacci_directions(config.n_rays)
+    edge_pairs, _ = fibonacci_ray_adjacency(
+        config.n_rays, epsilon=config.connectivity_epsilon
+    )
     tree = cKDTree(cloud.coords)
 
     if target_indices is None:
@@ -143,6 +158,7 @@ def steric_exposure_batch(
                 config=config,
                 directions=directions,
                 tree=tree,
+                edge_pairs=edge_pairs,
             )
         )
     return results

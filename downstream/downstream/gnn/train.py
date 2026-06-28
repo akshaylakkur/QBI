@@ -38,7 +38,7 @@ class TrainConfig:
     knn_k: int = 12
     seed: int = 42
     synthetic_nodes: int = 50_000
-    synthetic_n_rays: int = 200
+    synthetic_n_rays: int = 2000
 
 
 def _set_seed(seed: int) -> None:

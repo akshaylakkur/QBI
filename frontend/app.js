@@ -135,6 +135,9 @@ const elements = {
   qaDetail: document.querySelector("#qa-detail"),
   overlayColorMode: document.querySelector("#overlay-color-mode"),
   selectedExposure: document.querySelector("#selected-exposure"),
+  selectedCleanExtraction: document.querySelector("#selected-clean-extraction"),
+  selectedAnisotropy: document.querySelector("#selected-anisotropy"),
+  selectedOpenDirection: document.querySelector("#selected-open-direction"),
   selectedGnnExposure: document.querySelector("#selected-gnn-exposure"),
   selectedNeighbors: document.querySelector("#selected-neighbors"),
   graphPanel: document.querySelector("#graph-panel"),
@@ -208,6 +211,8 @@ graphControls.dampingFactor = 0.08;
 graphControls.target.set(0, 0, 0);
 
 const graphGroup = new THREE.Group();
+const hemisphereGroup = new THREE.Group();
+graphGroup.add(hemisphereGroup);
 graphScene.add(graphGroup);
 graphScene.add(new THREE.AmbientLight(0xffffff, 1.15));
 const graphKeyLight = new THREE.DirectionalLight(0xffffff, 1.1);
@@ -326,7 +331,12 @@ function applyCrowdingResult(result) {
       ...det,
       stericExposure: enriched.stericExposure,
       gnnExposure: enriched.gnnExposure,
-      neighborCount: enriched.neighborCount
+      neighborCount: enriched.neighborCount,
+      anisotropyIndex: enriched.anisotropyIndex,
+      cleanExtractionScore: enriched.cleanExtractionScore,
+      openDirection: enriched.openDirection,
+      cleanConeHalfAngleDeg: enriched.cleanConeHalfAngleDeg,
+      nOpenComponents: enriched.nOpenComponents
     };
   });
 
@@ -376,23 +386,24 @@ function renderExposureSummary(summary) {
         <tr>
           <td>${type}</td>
           <td>${stats.count ?? 0}</td>
+          <td>${stats.meanCleanExtraction?.toFixed(3) ?? stats.meanExposure?.toFixed(3) ?? "—"}</td>
           <td>${stats.meanExposure?.toFixed(3) ?? "—"}</td>
         </tr>`
     )
     .join("");
 
   elements.crowdingSummary.innerHTML = `
-    <p class="crowding-heading">Crowding analyzed</p>
+    <p class="crowding-heading">Crowding analyzed (${summary.nRays ?? 2000} rays)</p>
     <div class="crowding-stats-compact">
       <span><strong>${summary.particleCount ?? 0}</strong> particles</span>
-      <span>mean ${summary.meanExposure?.toFixed(3) ?? "—"}</span>
-      <span>P10 ${summary.p10Exposure?.toFixed(3) ?? "—"}</span>
-      <span>P90 ${summary.p90Exposure?.toFixed(3) ?? "—"}</span>
+      <span>clean ${summary.meanCleanExtraction?.toFixed(3) ?? "—"}</span>
+      <span>P10 ${summary.p10CleanExtraction?.toFixed(3) ?? "—"}</span>
+      <span>exp ${summary.meanExposure?.toFixed(3) ?? "—"}</span>
     </div>
     ${
       typeRows
         ? `<table class="crowding-type-table">
-            <thead><tr><th>Type</th><th>Count</th><th>Mean exp.</th></tr></thead>
+            <thead><tr><th>Type</th><th>Count</th><th>Mean clean</th><th>Mean exp.</th></tr></thead>
             <tbody>${typeRows}</tbody>
           </table>`
         : ""
@@ -465,6 +476,7 @@ function frameGraphCamera(maxDistance) {
 
 function renderGraphPanel(detection) {
   clearGroup(graphGroup);
+  graphGroup.add(hemisphereGroup);
 
   if (!state.crowdingSummary) {
     updateGraphPanelVisibility();
@@ -493,12 +505,12 @@ function renderGraphPanel(detection) {
     return;
   }
 
-  const exposure = detectionExposureValue(detection);
-  const { openDirection } = computeAccessibilityCompass(detection, neighbors, centerPhys);
+  const cleanScore = detectionStaScore(detection);
+  const openDir = detection.openDirection;
   setGraphCaption(
     `${detection.type || detection.molecule} · ${neighbors.length} neighbors${
-      exposure !== null ? ` · exposure ${exposure.toFixed(2)}` : ""
-    } · open hemisphere ${openDirection.y >= 0 ? "↑" : "↓"}${Math.abs(openDirection.x) > 0.35 ? (openDirection.x > 0 ? " →" : " ←") : ""}`
+      cleanScore !== null ? ` · clean ${cleanScore.toFixed(2)}` : ""
+    }${openDir ? ` · open ${formatOpenDirectionLabel(openDir)}` : ""}`
   );
 
   const centerMesh = new THREE.Mesh(
@@ -541,10 +553,16 @@ function renderGraphPanel(detection) {
     );
   }
 
-  addAccessibilityOverlays(graphGroup, detection, neighbors, centerPhys, maxDistance);
-
   frameGraphCamera(maxDistance);
   resizeGraphViewer();
+
+  const shellRadius = Math.max(0.14, maxDistance * 0.55);
+  fetchHemisphereForPick(detection).then((hemisphereData) => {
+    if (state.selectedDetection?.id !== detection.id) {
+      return;
+    }
+    renderHemisphereHeatmap(hemisphereData, shellRadius);
+  });
 }
 
 function resizeGraphViewer() {
@@ -595,19 +613,24 @@ function detectionExposureValue(detection) {
   return Number.isFinite(value) ? value : null;
 }
 
+function detectionStaScore(detection) {
+  const value = detection?.cleanExtractionScore;
+  return Number.isFinite(value) ? value : null;
+}
+
 function hasExposureData() {
-  return state.detections.some((det) => detectionExposureValue(det) !== null);
+  return state.detections.some((det) => detectionStaScore(det) !== null);
 }
 
 function passesOcclusionFilter(detection) {
   if (state.minOcclusionFilter <= 0) {
     return true;
   }
-  const exposure = detectionExposureValue(detection);
-  if (exposure === null) {
+  const score = detectionStaScore(detection);
+  if (score === null) {
     return false;
   }
-  return exposure >= state.minOcclusionFilter;
+  return score >= state.minOcclusionFilter;
 }
 
 function visibleDetections() {
@@ -643,8 +666,8 @@ function updateOcclusionFilterUI() {
   if (elements.occlusionFilterStats) {
     elements.occlusionFilterStats.textContent =
       threshold > 0
-        ? `${visibleCount} / ${total} picks pass filter (≥ ${threshold.toFixed(2)} exposure)`
-        : `${total} picks visible · slide to prune crowded particles for STA`;
+        ? `${visibleCount} / ${total} picks pass filter (≥ ${threshold.toFixed(2)} clean extraction)`
+        : `${total} picks visible · slide to prune low clean-extraction particles for STA`;
   }
   if (elements.exportCleanPicks) {
     elements.exportCleanPicks.disabled = visibleCount === 0;
@@ -659,7 +682,7 @@ function applyOcclusionFilter() {
   syncViewerAnnotations();
   refreshSlicePreviews();
   if (state.selectedDetection && !passesOcclusionFilter(state.selectedDetection)) {
-    elements.selectedNotes.textContent = `${state.selectedDetection.notes} Filtered out by occlusion gate (exposure below ${state.minOcclusionFilter.toFixed(2)}).`;
+    elements.selectedNotes.textContent = `${state.selectedDetection.notes} Filtered out by clean extraction gate (score below ${state.minOcclusionFilter.toFixed(2)}).`;
   }
 }
 
@@ -699,7 +722,7 @@ function syncPickOverlays() {
 function exportCleanCopickPicks() {
   const visible = visibleDetections();
   if (!visible.length) {
-    showError(new Error("No picks pass the current occlusion filter."));
+    showError(new Error("No picks pass the current clean extraction filter."));
     return;
   }
 
@@ -722,20 +745,27 @@ function exportCleanCopickPicks() {
     trust_orientation: true,
     points: picks.map((detection) => {
       const physical = getDetectionPhysical(detection);
+      const openDir = detection.openDirection;
+      const transform = openDir && Number.isFinite(openDir.x)
+        ? rotationMatrixFromOpenDirection(openDir)
+        : [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+          ];
       return {
         location: {
           x: physical?.x ?? 0,
           y: physical?.y ?? 0,
           z: physical?.z ?? 0
         },
-        transformation_: [
-          [1, 0, 0, 0],
-          [0, 1, 0, 0],
-          [0, 0, 1, 0],
-          [0, 0, 0, 1]
-        ],
+        transformation_: transform,
         instance_id: 0,
-        score: detectionExposureValue(detection) ?? 1
+        score: detectionStaScore(detection) ?? 1,
+        open_direction: openDir || null,
+        anisotropy_index: detection.anisotropyIndex ?? null,
+        steric_exposure: detection.stericExposure ?? null
       };
     })
   }));
@@ -743,7 +773,7 @@ function exportCleanCopickPicks() {
   const payload = {
     export_format: "copick_bundle",
     exported_at: new Date().toISOString(),
-    min_occlusion_filter: state.minOcclusionFilter,
+    min_clean_extraction_filter: state.minOcclusionFilter,
     tomo_id: currentTomoId(),
     particle_count: visible.length,
     files
@@ -758,122 +788,94 @@ function exportCleanCopickPicks() {
   URL.revokeObjectURL(url);
 }
 
-function neighborBlockingContribution(centerDetection, neighbor, neighborDet, centerPhys) {
-  const phys = neighborDet ? getDetectionPhysical(neighborDet) : neighbor.physical;
-  if (!phys) {
-    return null;
-  }
-
-  const distAngstrom = Math.hypot(
-    phys.x - centerPhys.x,
-    phys.y - centerPhys.y,
-    phys.z - centerPhys.z
-  );
-  if (distAngstrom < 1e-6) {
-    return null;
-  }
-
-  const graphVec = graphPositionFromPhysical(phys, centerPhys);
-  const neighborRadius = moleculeRadiusAngstrom(neighborDet || {
-    molecule: neighbor.molecule,
-    radiusAngstrom: neighbor.radiusAngstrom
-  });
-  const centerRadius = moleculeRadiusAngstrom(centerDetection);
-  const solidAngle = Math.min(1, (neighborRadius / distAngstrom) ** 2);
-  const overlap = Math.max(0, centerRadius + neighborRadius - distAngstrom);
-  const weight = solidAngle * (1 + overlap / Math.max(neighborRadius, 1));
-  return {
-    direction: graphVec.clone().normalize(),
-    weight,
-    neighborRadius,
-    distAngstrom
-  };
+function rotationMatrixFromOpenDirection(openDir) {
+  const zAxis = openDirectionGraphVector({ openDirection: openDir });
+  const up = Math.abs(zAxis.y) < 0.99 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+  const xAxis = new THREE.Vector3().crossVectors(up, zAxis).normalize();
+  const yAxis = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+  return [
+    [xAxis.x, yAxis.x, zAxis.x, 0],
+    [xAxis.y, yAxis.y, zAxis.y, 0],
+    [xAxis.z, yAxis.z, zAxis.z, 0],
+    [0, 0, 0, 1]
+  ];
 }
 
-function computeAccessibilityCompass(centerDetection, neighbors, centerPhys) {
-  const blockers = [];
-  const blockSum = new THREE.Vector3();
+function openDirectionGraphVector(detection) {
+  const d = detection?.openDirection;
+  if (!d || !Number.isFinite(d.x)) {
+    return new THREE.Vector3(0, 1, 0);
+  }
+  return new THREE.Vector3(d.x, d.y, d.z).normalize();
+}
 
-  neighbors.forEach((neighbor) => {
-    const neighborDet = state.detections.find((d) => d.id === neighbor.id);
-    const contribution = neighborBlockingContribution(centerDetection, neighbor, neighborDet, centerPhys);
-    if (!contribution || contribution.weight < 0.02) {
-      return;
+function formatOpenDirectionLabel(openDir) {
+  if (!openDir || !Number.isFinite(openDir.x)) {
+    return "—";
+  }
+  return `(${openDir.x.toFixed(2)}, ${openDir.y.toFixed(2)}, ${openDir.z.toFixed(2)})`;
+}
+
+let hemisphereFetchId = 0;
+
+async function fetchHemisphereForPick(detection) {
+  if (!detection?.id || !state.detections.length) {
+    return null;
+  }
+  const reqId = ++hemisphereFetchId;
+  try {
+    const payload = await fetchJson("/api/graph/hemisphere", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pickId: detection.id,
+        tomoId: currentTomoId(),
+        detections: state.detections
+      })
+    });
+    if (reqId !== hemisphereFetchId) {
+      return null;
     }
-    blockers.push(contribution);
-    blockSum.add(contribution.direction.clone().multiplyScalar(contribution.weight));
-  });
-
-  const openDirection = blockSum.lengthSq() > 1e-8
-    ? blockSum.clone().normalize().negate()
-    : new THREE.Vector3(0, 1, 0);
-
-  blockers.sort((a, b) => b.weight - a.weight);
-  return { openDirection, blockers };
+    return payload;
+  } catch (error) {
+    console.warn("Hemisphere fetch failed:", error);
+    return null;
+  }
 }
 
-function addAccessibilityOverlays(graphGroup, centerDetection, neighbors, centerPhys, maxDistance) {
-  const { openDirection, blockers } = computeAccessibilityCompass(centerDetection, neighbors, centerPhys);
-  const arrowLength = Math.max(0.12, maxDistance * 0.95);
+function renderHemisphereHeatmap(hemisphereData, shellRadius) {
+  clearGroup(hemisphereGroup);
+  if (!hemisphereData?.directions?.length) {
+    return;
+  }
 
-  const openArrow = new THREE.ArrowHelper(
-    openDirection,
-    new THREE.Vector3(0, 0, 0),
-    arrowLength,
-    0x18a87a,
-    arrowLength * 0.22,
-    arrowLength * 0.14
-  );
-  openArrow.line.material.transparent = true;
-  openArrow.line.material.opacity = 0.9;
-  openArrow.cone.material.transparent = true;
-  openArrow.cone.material.opacity = 0.92;
-  graphGroup.add(openArrow);
+  const positions = [];
+  const colors = [];
+  hemisphereData.directions.forEach((dir, index) => {
+    const open = !hemisphereData.blocked[index];
+    positions.push(dir[0] * shellRadius, dir[1] * shellRadius, dir[2] * shellRadius);
+    if (open) {
+      colors.push(0.35, 0.88, 0.62);
+    } else {
+      colors.push(0.92, 0.35, 0.35);
+    }
+  });
 
-  const openDisk = new THREE.Mesh(
-    new THREE.CircleGeometry(arrowLength * 0.34, 32),
-    new THREE.MeshBasicMaterial({
-      color: 0x8ce8c8,
-      transparent: true,
-      opacity: 0.22,
-      side: THREE.DoubleSide,
-      depthWrite: false
-    })
-  );
-  openDisk.position.copy(openDirection.clone().multiplyScalar(arrowLength * 0.42));
-  openDisk.lookAt(openDisk.position.clone().add(openDirection));
-  graphGroup.add(openDisk);
-
-  blockers.slice(0, 4).forEach((blocker) => {
-    const blockArrow = new THREE.ArrowHelper(
-      blocker.direction,
-      new THREE.Vector3(0, 0, 0),
-      arrowLength * (0.35 + blocker.weight * 0.25),
-      0xd94848,
-      arrowLength * 0.1,
-      arrowLength * 0.07
-    );
-    blockArrow.line.material.transparent = true;
-    blockArrow.line.material.opacity = 0.45;
-    blockArrow.cone.material.transparent = true;
-    blockArrow.cone.material.opacity = 0.5;
-    graphGroup.add(blockArrow);
-
-    const blockDisk = new THREE.Mesh(
-      new THREE.CircleGeometry(arrowLength * 0.16 * Math.sqrt(blocker.weight), 24),
-      new THREE.MeshBasicMaterial({
-        color: 0xf2a3a3,
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  hemisphereGroup.add(
+    new THREE.Points(
+      geometry,
+      new THREE.PointsMaterial({
+        size: shellRadius * 0.08,
+        vertexColors: true,
         transparent: true,
-        opacity: 0.18 + blocker.weight * 0.12,
-        side: THREE.DoubleSide,
+        opacity: 0.85,
         depthWrite: false
       })
-    );
-    const diskOffset = blocker.direction.clone().multiplyScalar(arrowLength * 0.18);
-    blockDisk.position.copy(diskOffset);
-    blockDisk.lookAt(diskOffset.clone().add(blocker.direction));
-    graphGroup.add(blockDisk);
-  });
+    )
+  );
 }
 
 function exposureColorRgb(exposure) {
@@ -886,6 +888,12 @@ function exposureColorRgb(exposure) {
 }
 
 function detectionColorArray(detection) {
+  if (state.overlayColorMode === "clean") {
+    const score = detectionStaScore(detection);
+    if (score !== null) {
+      return exposureColorRgb(score);
+    }
+  }
   if (state.overlayColorMode === "exposure") {
     const exposure = detectionExposureValue(detection);
     if (exposure !== null) {
@@ -1721,11 +1729,11 @@ function renderDetectionList() {
         const label = document.createElement("span");
         label.textContent = det.id;
         row.append(dot, label);
-        const exposure = detectionExposureValue(det);
-        if (exposure !== null) {
+        const staScore = detectionStaScore(det);
+        if (staScore !== null) {
           const badge = document.createElement("span");
           badge.className = `exposure-badge${filteredOut ? " is-below-threshold" : ""}`;
-          badge.textContent = exposure.toFixed(2);
+          badge.textContent = staScore.toFixed(2);
           row.append(badge);
         }
         row.addEventListener("click", (e) => {
@@ -1938,6 +1946,9 @@ function showPickInfo(detection) {
   setInfoLabel(elements.selectedConfidence, "Confidence");
   setInfoLabel(elements.selectedPosition, "Position");
   setInfoLabel(elements.selectedExposure, "Steric exposure");
+  setInfoLabel(elements.selectedCleanExtraction, "Clean extraction");
+  setInfoLabel(elements.selectedAnisotropy, "Anisotropy");
+  setInfoLabel(elements.selectedOpenDirection, "Open direction");
   setInfoLabel(elements.selectedGnnExposure, "GNN exposure");
   setInfoLabel(elements.selectedNeighbors, "Neighbors");
   setInfoLabel(elements.selectedNotes, "Notes");
@@ -1947,6 +1958,15 @@ function showPickInfo(detection) {
   elements.selectedPosition.textContent = detection.position;
   elements.selectedExposure.textContent = Number.isFinite(detection.stericExposure)
     ? detection.stericExposure.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedCleanExtraction.textContent = Number.isFinite(detection.cleanExtractionScore)
+    ? detection.cleanExtractionScore.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedAnisotropy.textContent = Number.isFinite(detection.anisotropyIndex)
+    ? detection.anisotropyIndex.toFixed(3)
+    : "Run crowding analysis";
+  elements.selectedOpenDirection.textContent = detection.openDirection
+    ? formatOpenDirectionLabel(detection.openDirection)
     : "Run crowding analysis";
   elements.selectedGnnExposure.textContent = Number.isFinite(detection.gnnExposure)
     ? detection.gnnExposure.toFixed(3)
