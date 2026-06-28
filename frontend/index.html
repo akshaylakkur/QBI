@@ -49,8 +49,12 @@
         <section class="panel upload-panel">
           <div class="panel-heading">
             <h2>Scan source</h2>
-            <span id="load-status" class="status-pill">Starting</span>
+            <div class="status-row">
+              <span id="load-status" class="status-pill">Starting</span>
+              <span id="qa-status" class="status-pill qa-pill" hidden>QA</span>
+            </div>
           </div>
+          <p id="qa-detail" class="qa-detail" hidden></p>
 
           <label class="dropzone" for="zarr-upload">
             <input id="zarr-upload" type="file" multiple webkitdirectory directory>
@@ -70,6 +74,13 @@
             <label>
               Dataset
               <select id="scan-select"></select>
+            </label>
+            <label>
+              Overlay color
+              <select id="overlay-color-mode">
+                <option value="type" selected>By molecule type</option>
+                <option value="exposure">By steric exposure</option>
+              </select>
             </label>
             <label>
               Upload labels
@@ -101,6 +112,16 @@
               </div>
               <span id="inference-status" class="inference-status-text">Starting...</span>
             </div>
+            <button id="run-crowding" type="button" class="inference-button crowding-button" disabled>
+              <span class="inference-icon">◎</span>
+              Analyze Crowding
+            </button>
+            <div id="crowding-progress" class="inference-progress" hidden>
+              <div class="inference-progress-bar">
+                <span id="crowding-progress-fill" class="inference-progress-fill"></span>
+              </div>
+              <span id="crowding-status" class="inference-status-text">Starting...</span>
+            </div>
           </div>
         </section>
 
@@ -130,6 +151,7 @@
       </aside>
 
       <section class="viewer-region" aria-label="3D volume and detection review">
+        <div class="viewer-row">
         <section class="viewer-panel">
           <div class="viewer-toolbar">
             <div>
@@ -183,6 +205,19 @@
           </div>
         </section>
 
+        <section id="graph-panel" class="panel graph-panel" hidden aria-label="Local neighborhood graph">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Crowding graph</p>
+              <h2 id="graph-pick-label">Neighborhood</h2>
+            </div>
+            <button id="reset-graph-camera" type="button" class="icon-button" aria-label="Reset graph view">↺</button>
+          </div>
+          <div id="graph-viewer" class="graph-canvas" aria-label="3D particle neighborhood graph"></div>
+          <p id="graph-caption" class="graph-caption">Run crowding analysis, then select a pick.</p>
+        </section>
+        </div>
+
         <section class="review-grid">
           <article class="panel detections-panel">
             <div class="panel-heading">
@@ -192,6 +227,15 @@
                 <button id="show-all-molecules" type="button" class="show-all-btn" hidden>Show all</button>
               </div>
             </div>
+            <div id="occlusion-filter-panel" class="occlusion-filter-panel" hidden>
+              <label class="occlusion-filter-label" for="occlusion-filter-slider">
+                <span>Minimum Ambient Occlusion Filter</span>
+                <strong id="occlusion-filter-value">0.00</strong>
+              </label>
+              <input id="occlusion-filter-slider" type="range" min="0" max="100" value="0" step="1" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+              <p id="occlusion-filter-stats" class="occlusion-filter-stats">Run crowding analysis to enable filtering.</p>
+              <button id="export-clean-picks" type="button" class="export-clean-picks-btn">Export Clean Copick Picks</button>
+            </div>
             <div id="detection-list" class="detection-list"></div>
           </article>
 
@@ -200,6 +244,7 @@
               <h2>Dataset analysis</h2>
               <span id="analysis-status" class="status-pill">Waiting for labels</span>
             </div>
+            <div id="crowding-summary" class="crowding-summary" hidden></div>
             <div id="analysis-summary" class="analysis-summary"></div>
             <div id="analysis-report" class="analysis-report">
               Upload a Picks labels folder to generate molecule-level insights and a structured interpretation.
@@ -224,6 +269,18 @@
                 <div>
                   <dt>Position</dt>
                   <dd id="selected-position">-</dd>
+                </div>
+                <div>
+                  <dt>Steric exposure</dt>
+                  <dd id="selected-exposure">-</dd>
+                </div>
+                <div>
+                  <dt>GNN exposure</dt>
+                  <dd id="selected-gnn-exposure">-</dd>
+                </div>
+                <div>
+                  <dt>Neighbors</dt>
+                  <dd id="selected-neighbors">-</dd>
                 </div>
                 <div>
                   <dt>Notes</dt>
