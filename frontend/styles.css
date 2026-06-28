@@ -593,16 +593,32 @@ input[type="range"] {
   line-height: 1;
   pointer-events: auto;
   transform-origin: left top;
+  translate: 14px -50%;
 }
 
 .viewer-annotation::before {
   content: "";
   position: absolute;
-  left: -10px;
-  top: 13px;
-  width: 10px;
+  left: -14px;
+  top: 50%;
+  width: 14px;
   height: 1px;
+  transform: translateY(-50%);
   background: var(--annotation-color);
+}
+
+.viewer-annotation::after {
+  content: "";
+  position: absolute;
+  left: -18px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+  background: var(--annotation-color);
+  box-shadow: 0 0 0 1px rgba(23, 32, 38, 0.22);
+  transform: translateY(-50%);
 }
 
 .viewer-annotation-dot {

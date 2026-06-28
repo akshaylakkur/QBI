@@ -237,8 +237,61 @@ function detectionWorldPosition(detection) {
   );
 }
 
+function detectionSliceWorldPosition(detection, axis) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape;
+  const voxel = detection?.voxel;
+  if (!shape || !voxel) {
+    return null;
+  }
+
+  const dimensions = volumeDimensions();
+  const x = ((voxel.x / Math.max(1, shape.x - 1)) - 0.5) * dimensions.x;
+  const y = (0.5 - (voxel.y / Math.max(1, shape.y - 1))) * dimensions.y;
+  const z = ((voxel.z / Math.max(1, shape.z - 1)) - 0.5) * dimensions.z;
+
+  if (axis === "x") {
+    return new THREE.Vector3(sliceWorldPosition("x"), y, z);
+  }
+  if (axis === "y") {
+    return new THREE.Vector3(x, -sliceWorldPosition("y"), z);
+  }
+  return new THREE.Vector3(x, y, sliceWorldPosition("z"));
+}
+
+function visibleSliceAxesForDetection(detection) {
+  const voxel = detection?.voxel;
+  if (!voxel) {
+    return [];
+  }
+
+  return sliceAxes
+    .map((axis) => ({
+      axis,
+      distance: Math.abs(voxel[axis] - state.currentSlices[axis])
+    }))
+    .filter((item) => item.distance <= moleculeRadiusVoxels(detection))
+    .sort((a, b) => {
+      if (a.axis === state.activeSliceAxis) {
+        return -1;
+      }
+      if (b.axis === state.activeSliceAxis) {
+        return 1;
+      }
+      return a.distance - b.distance;
+    })
+    .map((item) => item.axis);
+}
+
+function annotationWorldPosition(detection) {
+  const visibleAxes = visibleSliceAxesForDetection(detection);
+  if (visibleAxes.length > 0) {
+    return detectionSliceWorldPosition(detection, visibleAxes[0]);
+  }
+  return state.selectedDetection ? detectionWorldPosition(detection) : null;
+}
+
 function projectedViewerPosition(detection) {
-  const worldPosition = detectionWorldPosition(detection);
+  const worldPosition = annotationWorldPosition(detection);
   if (!worldPosition) {
     return null;
   }
@@ -267,7 +320,30 @@ function selectedAnnotationDetections() {
 
   return state.detections
     .filter((detection) => (detection.molecule || detection.type) === state.selectedMolecule)
+    .filter((detection) => visibleSliceAxesForDetection(detection).length > 0)
     .slice(0, annotationLimit);
+}
+
+function focusSlicesOnDetection(detection) {
+  const voxel = detection?.voxel;
+  const shape = state.sliceShape || state.volume?.shape;
+  if (!voxel || !shape) {
+    return;
+  }
+
+  sliceAxes.forEach((axis) => {
+    const nextSlice = Math.max(0, Math.min(shape[axis] - 1, Math.round(voxel[axis])));
+    state.currentSlices[axis] = nextSlice;
+    if (elements.sliceSliders[axis]) {
+      elements.sliceSliders[axis].value = String(nextSlice);
+    }
+    setSliceSliderValue(axis);
+    scheduleInteractiveSlice(axis);
+  });
+
+  setActiveSliceAxis("z");
+  updateSliceSeams();
+  refreshSlicePreviews();
 }
 
 function syncViewerAnnotations() {
@@ -281,7 +357,7 @@ function syncViewerAnnotations() {
     const annotation = document.createElement("button");
     annotation.type = "button";
     annotation.className = `viewer-annotation${state.selectedDetection ? " is-single" : ""}`;
-    annotation.style.setProperty("--annotation-color", detection.color || "#0b7f83");
+    annotation.style.setProperty("--annotation-color", `rgb(${detectionColorArray(detection).join(", ")})`);
     annotation.dataset.detectionId = detection.id;
     const dot = document.createElement("span");
     dot.className = "viewer-annotation-dot";
@@ -311,7 +387,7 @@ function updateAnnotationPositions() {
     }
 
     element.hidden = false;
-    element.style.transform = `translate(${position.x + 10}px, ${position.y - 14}px)`;
+    element.style.transform = `translate(${position.x}px, ${position.y}px)`;
   });
 }
 
@@ -1026,6 +1102,7 @@ function selectDetection(id) {
   state.selectedMolecule = detection.molecule || detection.type;
   state.expandedMolecules.add(state.selectedMolecule);
 
+  focusSlicesOnDetection(detection);
   showPickInfo(detection);
   syncViewerAnnotations();
   renderDetectionList();
@@ -1551,7 +1628,11 @@ sliceAxes.forEach((axis) => {
     setSliceSliderValue(axis);
     setActiveSliceAxis(axis);
     updateSliceSeams();
-    updateAnnotationPositions();
+    if (state.selectedMolecule && !state.selectedDetection) {
+      syncViewerAnnotations();
+    } else {
+      updateAnnotationPositions();
+    }
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });
