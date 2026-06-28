@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QBI Viv 3D Test</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="test3d-body">
+    <main class="test3d-shell">
+      <header class="test3d-header">
+        <div>
+          <p class="eyebrow">Viv volume rendering</p>
+          <h1>TS_5_4 Denoised Zarr</h1>
+        </div>
+        <div class="test3d-status">
+          <span id="test3d-status" class="status-pill">Starting</span>
+          <span id="test3d-shape" class="status-pill">Shape -</span>
+        </div>
+      </header>
+
+      <section class="test3d-viewer-panel">
+        <canvas id="test3d-canvas" aria-label="Viv isometric Zarr volume viewer"></canvas>
+        <div id="test3d-message" class="viewer-message">Loading Viv volume</div>
+      </section>
+    </main>
+
+    <script type="module" src="test3d.js"></script>
+  </body>
+</html>
