@@ -40,12 +40,15 @@ function getMoleculeGroups() {
 }
 
 const highDetailSliceLevel = "0";
-const highDetailSliceMaxSize = "1024";
+const highDetailSliceMaxSize = "512";
 const interactiveSliceMaxSize = "420";
+const slicePrecacheConcurrency = Math.max(3, Math.min(8, (navigator.hardwareConcurrency || 6) - 1));
+const slicePrecacheBatchSize = slicePrecacheConcurrency * 2;
 const sliceAxes = ["x", "y", "z"];
 const sliceCache = new Map();
 const sliceTimers = { x: null, y: null, z: null };
 const prefetchTimers = { x: null, y: null, z: null };
+let precacheRunId = 0;
 let vivDeck = null;
 let vivLoader = null;
 let vivView = null;
@@ -60,6 +63,7 @@ const elements = {
   pointLimit: document.querySelector("#point-limit"),
   pointSize: document.querySelector("#point-size"),
   upload: document.querySelector("#zarr-upload"),
+  labelsUpload: document.querySelector("#labels-upload"),
   localZarrPath: document.querySelector("#local-zarr-path"),
   openLocalZarr: document.querySelector("#open-local-zarr"),
   loadStatus: document.querySelector("#load-status"),
@@ -69,6 +73,9 @@ const elements = {
   range: document.querySelector("#volume-range"),
   stride: document.querySelector("#volume-stride"),
   detectionCount: document.querySelector("#detection-count"),
+  analysisStatus: document.querySelector("#analysis-status"),
+  analysisSummary: document.querySelector("#analysis-summary"),
+  analysisReport: document.querySelector("#analysis-report"),
   showAllBtn: document.querySelector("#show-all-molecules"),
   detectionList: document.querySelector("#detection-list"),
   selectedId: document.querySelector("#selected-id"),
@@ -163,6 +170,20 @@ function setProgress(percent) {
   elements.progress.style.width = `${Math.max(0, Math.min(100, percent))}%`;
 }
 
+function showLoadingScreen(title, detail = "") {
+  elements.message.hidden = false;
+  elements.message.classList.add("is-cache-status");
+  elements.message.innerHTML = detail
+    ? `<strong>${title}</strong><small>${detail}</small>`
+    : `<strong>${title}</strong>`;
+}
+
+function hideLoadingScreen() {
+  elements.message.classList.remove("is-cache-status");
+  elements.message.hidden = true;
+  elements.message.textContent = "";
+}
+
 function resizeViewer() {
   const rect = elements.viewer.getBoundingClientRect();
   camera.aspect = rect.width / Math.max(1, rect.height);
@@ -221,6 +242,134 @@ function detectionColorNumber(detection) {
   return (r << 16) + (g << 8) + b;
 }
 
+function moleculeRadiusVoxels(detection) {
+  if (Number.isFinite(detection?.radiusVoxel) && detection.radiusVoxel > 0) {
+    return detection.radiusVoxel;
+  }
+
+  const molecule = detection?.molecule || "";
+  const radii = {
+    "apo-ferritin": 6,
+    "beta-amylase": 7,
+    "beta-galactosidase": 9,
+    "ribosome": 15,
+    "thyroglobulin": 13,
+    "virus-like-particle": 14
+  };
+  return radii[molecule] || 8;
+}
+
+function moleculeRadiusAngstrom(detection) {
+  if (Number.isFinite(detection?.radiusAngstrom) && detection.radiusAngstrom > 0) {
+    return detection.radiusAngstrom;
+  }
+  return moleculeRadiusVoxels(detection) * 10;
+}
+
+function moleculeRadiusWorld(detection) {
+  const dimensions = volumeDimensions();
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape || { x: 1, y: 1, z: 1 };
+  const longestAxis = Math.max(1, shape.x, shape.y, shape.z);
+  const normalizedRadius = moleculeRadiusVoxels(detection) / longestAxis;
+  return normalizedRadius * Math.max(dimensions.x, dimensions.y, dimensions.z);
+}
+
+function colorizedScanRgb(value) {
+  const intensity = Math.max(0, Math.min(255, value)) / 255;
+  return [
+    Math.round(36 + intensity * 219),
+    Math.round(32 + intensity * 197),
+    Math.round(42 + intensity * 142)
+  ];
+}
+
+function sliceSourceSize(axis) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape || { x: 1, y: 1, z: 1 };
+  if (axis === "x") {
+    return { width: shape.y, height: shape.z, depth: shape.x };
+  }
+  if (axis === "y") {
+    return { width: shape.x, height: shape.z, depth: shape.y };
+  }
+  return { width: shape.x, height: shape.y, depth: shape.z };
+}
+
+function detectionSliceProjection(detection, axis, width, height) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape;
+  const voxel = detection.voxel;
+  if (!shape || !voxel) {
+    return null;
+  }
+
+  const source = sliceSourceSize(axis);
+  const position = {
+    x: axis === "x" ? voxel.y : voxel.x,
+    y: axis === "z" ? voxel.y : voxel.z,
+    axis: voxel[axis]
+  };
+
+  return {
+    x: (position.x / Math.max(1, source.width - 1)) * Math.max(0, width - 1),
+    y: (position.y / Math.max(1, source.height - 1)) * Math.max(0, height - 1),
+    axisPosition: position.axis,
+    radius: moleculeRadiusVoxels(detection) * (width / Math.max(1, source.width)),
+    axisRadius: moleculeRadiusVoxels(detection)
+  };
+}
+
+function createColorizedSliceData(axis, bytes, width, height) {
+  const textureData = new Uint8Array(width * height * 4);
+  for (let index = 0; index < bytes.length; index += 1) {
+    const [r, g, b] = colorizedScanRgb(bytes[index]);
+    textureData[index * 4] = r;
+    textureData[index * 4 + 1] = g;
+    textureData[index * 4 + 2] = b;
+    textureData[index * 4 + 3] = 255;
+  }
+
+  const sliceIndex = state.currentSlices[axis];
+  state.detections.forEach((detection) => {
+    const projection = detectionSliceProjection(detection, axis, width, height);
+    if (!projection) {
+      return;
+    }
+
+    const axisDistance = Math.abs(projection.axisPosition - sliceIndex);
+    if (axisDistance > projection.axisRadius) {
+      return;
+    }
+
+    const sliceRadius = Math.max(
+      2,
+      projection.radius * Math.sqrt(Math.max(0, 1 - (axisDistance / projection.axisRadius) ** 2))
+    );
+    const [overlayR, overlayG, overlayB] = detectionColorArray(detection);
+    const alpha = 0.24 + 0.38 * (1 - axisDistance / projection.axisRadius);
+    const minX = Math.max(0, Math.floor(projection.x - sliceRadius - 2));
+    const maxX = Math.min(width - 1, Math.ceil(projection.x + sliceRadius + 2));
+    const minY = Math.max(0, Math.floor(projection.y - sliceRadius - 2));
+    const maxY = Math.min(height - 1, Math.ceil(projection.y + sliceRadius + 2));
+
+    for (let y = minY; y <= maxY; y += 1) {
+      for (let x = minX; x <= maxX; x += 1) {
+        const distance = Math.hypot(x - projection.x, y - projection.y);
+        if (distance > sliceRadius) {
+          continue;
+        }
+
+        const edgeFade = 1 - Math.min(1, distance / sliceRadius);
+        const mixAmount = alpha * (0.45 + edgeFade * 0.55);
+        const offset = (y * width + x) * 4;
+        textureData[offset] = Math.round(textureData[offset] * (1 - mixAmount) + overlayR * mixAmount);
+        textureData[offset + 1] = Math.round(textureData[offset + 1] * (1 - mixAmount) + overlayG * mixAmount);
+        textureData[offset + 2] = Math.round(textureData[offset + 2] * (1 - mixAmount) + overlayB * mixAmount);
+      }
+    }
+  });
+
+  return textureData;
+}
+
 function vivDetectionPosition(detection) {
   const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape || { x: 1, y: 1, z: 1 };
   const res = vivLoader ? Math.max(0, vivLoader.length - 1) : 0;
@@ -242,7 +391,7 @@ function vivLayerProps() {
     loader: vivLoader,
     contrastLimits: [[-0.00004, 0.00002]],
     domain: [[-0.0001, 0.0001]],
-    colors: [[255, 255, 255]],
+    colors: [[255, 226, 168]],
     channelsVisible: [true],
     selections: [{}],
     resolution: Math.max(0, vivLoader.length - 1),
@@ -268,12 +417,13 @@ function vivDetectionLayer() {
     filled: true,
     lineWidthMinPixels: 1,
     radiusMinPixels: 3,
-    radiusMaxPixels: 14,
+    radiusMaxPixels: 28,
     getPosition: vivDetectionPosition,
     getRadius: (det) => {
-      if (det.id === selectedId) return 140;
+      const radius = moleculeRadiusVoxels(det);
+      if (det.id === selectedId) return radius * 1.45;
       const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
-      return inGroup ? 90 : 60;
+      return radius * (inGroup ? 1 : 0.72);
     },
     getFillColor: (det) => {
       if (det.id === selectedId) return [255, 185, 50, 255];
@@ -681,15 +831,7 @@ function updateSliceSeams() {
 }
 
 function updateVolumeSlicePlane(axis, bytes, width, height) {
-  const textureData = new Uint8Array(width * height * 4);
-  for (let index = 0; index < bytes.length; index += 1) {
-    const value = bytes[index];
-    textureData[index * 4] = value;
-    textureData[index * 4 + 1] = value;
-    textureData[index * 4 + 2] = value;
-    textureData[index * 4 + 3] = 255;
-  }
-
+  const textureData = createColorizedSliceData(axis, bytes, width, height);
   const texture = new THREE.DataTexture(textureData, width, height, THREE.RGBAFormat);
   texture.needsUpdate = true;
   texture.colorSpace = THREE.NoColorSpace;
@@ -717,7 +859,7 @@ function updateVolumeSlicePlane(axis, bytes, width, height) {
   setActiveSliceAxis(state.activeSliceAxis);
 }
 
-function drawGrayscaleCanvas(canvas, bytes, width, height) {
+function drawColorizedCanvas(axis, canvas, bytes, width, height) {
   if (!canvas) {
     return;
   }
@@ -726,20 +868,12 @@ function drawGrayscaleCanvas(canvas, bytes, width, height) {
   canvas.height = height;
   const context = canvas.getContext("2d");
   const image = context.createImageData(width, height);
-
-  for (let index = 0; index < bytes.length; index += 1) {
-    const value = bytes[index];
-    image.data[index * 4] = value;
-    image.data[index * 4 + 1] = value;
-    image.data[index * 4 + 2] = value;
-    image.data[index * 4 + 3] = 255;
-  }
-
+  image.data.set(createColorizedSliceData(axis, bytes, width, height));
   context.putImageData(image, 0, 0);
 }
 
 function drawMainSlice(axis, bytes, width, height, renderedLevel, renderedIndex) {
-  drawGrayscaleCanvas(mainSliceCanvas, bytes, width, height);
+  drawColorizedCanvas(axis, mainSliceCanvas, bytes, width, height);
   elements.message.hidden = true;
   elements.pointCount.textContent = `${axis.toUpperCase()} slice L${renderedLevel} ${renderedIndex}`;
 }
@@ -750,25 +884,19 @@ function drawSlicePreview(axis, bytes, width, height, renderedLevel, renderedInd
     return;
   }
 
-  drawGrayscaleCanvas(canvas, bytes, width, height);
+  drawColorizedCanvas(axis, canvas, bytes, width, height);
   elements.sliceLabels[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]} | L${renderedLevel} ${renderedIndex}`;
 }
 
 function refreshSlicePreviews() {
   sliceAxes.forEach((axis) => {
-    const canvas = elements.sliceCanvases[axis];
-    if (!canvas?.width || !canvas?.height) {
+    const cached = getCachedSlice(axis, state.currentSlices[axis], highDetailSliceMaxSize)
+      || getCachedSlice(axis, state.currentSlices[axis], interactiveSliceMaxSize);
+    if (!cached) {
       return;
     }
 
-    const context = canvas.getContext("2d");
-    const image = context.getImageData(0, 0, canvas.width, canvas.height);
-    const bytes = new Uint8ClampedArray(canvas.width * canvas.height);
-    for (let index = 0; index < bytes.length; index += 1) {
-      bytes[index] = image.data[index * 4];
-    }
-
-    drawSlicePreview(axis, bytes, canvas.width, canvas.height, "-", "-");
+    drawSlicePreview(axis, cached.bytes, cached.width, cached.height, cached.renderedLevel, cached.renderedIndex);
   });
 }
 
@@ -791,7 +919,7 @@ function renderVolumeScene(payload) {
   frame.name = "volume-bounds";
   volumeGroup.add(frame);
 
-  const sharedGeometry = new THREE.SphereGeometry(0.016, 16, 10);
+  const sharedGeometry = new THREE.SphereGeometry(1, 24, 16);
 
   payload.detections.forEach((detection) => {
     const markerMaterial = new THREE.MeshStandardMaterial({
@@ -806,6 +934,8 @@ function renderVolumeScene(payload) {
       -detection.coords[1] * dimensions.y,
       detection.coords[2] * dimensions.z
     );
+    marker.userData.baseScale = moleculeRadiusWorld(detection);
+    marker.scale.setScalar(marker.userData.baseScale);
     marker.userData.detection = detection;
     labelGroup.add(marker);
     markerObjects.set(detection.id, marker);
@@ -876,6 +1006,58 @@ function renderDetectionList() {
   });
 }
 
+function renderAnalysis(analysis) {
+  elements.analysisSummary.replaceChildren();
+
+  if (!analysis?.aggregation?.items?.length) {
+    elements.analysisStatus.textContent = "Waiting for labels";
+    elements.analysisReport.textContent = "Upload a Picks labels folder to generate molecule counts and a Claude-backed interpretation.";
+    return;
+  }
+
+  elements.analysisStatus.textContent = analysis.reportStatus || "Generated";
+  analysis.aggregation.items.forEach((item) => {
+    const card = document.createElement("div");
+    card.className = "analysis-card";
+    card.innerHTML = `
+      <span class="dot" style="background:${item.color}"></span>
+      <strong>${item.label}</strong>
+      <b>${item.count.toLocaleString()}</b>
+      <small>${item.frequencyPercent.toFixed(1)}% · ${item.difficulty}</small>
+    `;
+    elements.analysisSummary.append(card);
+  });
+
+  const report = analysis.report || analysis.localSummary || "No narrative report was returned.";
+  elements.analysisReport.replaceChildren();
+  report.split(/\n{2,}/).forEach((block) => {
+    const text = block.trim();
+    if (!text) {
+      return;
+    }
+    if (/^#{1,3}\s+/.test(text)) {
+      const heading = document.createElement("h3");
+      heading.textContent = text.replace(/^#{1,3}\s+/, "");
+      elements.analysisReport.append(heading);
+      return;
+    }
+    const paragraph = document.createElement("p");
+    paragraph.textContent = text.replace(/\*\*/g, "");
+    elements.analysisReport.append(paragraph);
+  });
+
+  if (analysis.reportError || analysis.reportErrorBody) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Claude Error";
+    elements.analysisReport.append(heading);
+
+    const errorBlock = document.createElement("pre");
+    errorBlock.className = "analysis-error";
+    errorBlock.textContent = [analysis.reportError, analysis.reportErrorBody].filter(Boolean).join("\n\n");
+    elements.analysisReport.append(errorBlock);
+  }
+}
+
 function setInfoLabel(ddElement, labelText) {
   if (ddElement.previousElementSibling?.tagName === "DT") {
     ddElement.previousElementSibling.textContent = labelText;
@@ -892,7 +1074,7 @@ function showPickInfo(detection) {
   elements.selectedType.textContent = detection.type;
   elements.selectedConfidence.textContent = detection.confidence;
   elements.selectedPosition.textContent = detection.position;
-  elements.selectedNotes.textContent = detection.notes;
+  elements.selectedNotes.textContent = `${detection.notes} Render radius ${Math.round(moleculeRadiusAngstrom(detection))} angstrom.`;
 }
 
 function showMoleculeGroupInfo(group) {
@@ -921,7 +1103,8 @@ function updateMarkerHighlights() {
       isSelected ? 0xb96d12 : (inGroup ? detectionColorNumber(det) : 0xb8c8cc)
     );
     marker.material.emissiveIntensity = isSelected ? 0.35 : (inGroup ? 0.15 : 0);
-    marker.scale.setScalar(isSelected ? 1.45 : inGroup ? 1.0 : 0.6);
+    const baseScale = marker.userData.baseScale || moleculeRadiusWorld(det);
+    marker.scale.setScalar(baseScale * (isSelected ? 1.45 : inGroup ? 1.0 : 0.6));
   });
 }
 
@@ -1004,9 +1187,6 @@ function setCachedSlice(axis, index, maxSize, value) {
     sliceCache.delete(key);
   }
   sliceCache.set(key, value);
-  while (sliceCache.size > 96) {
-    sliceCache.delete(sliceCache.keys().next().value);
-  }
 }
 
 async function loadScans() {
@@ -1058,6 +1238,7 @@ async function loadPreview() {
 
   setStatus("Decoding", true);
   setProgress(22);
+  elements.message.classList.remove("is-cache-status");
   elements.message.hidden = false;
   elements.message.textContent = "Decoding Zarr preview";
 
@@ -1102,7 +1283,9 @@ async function loadPreview() {
     state.expandedMolecules.add(initialGroups[0].molecule);
   }
   renderDetectionList();
+  renderAnalysis(payload.analysis);
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
+  startSlicePrecache("Caching scan slices");
   setActiveSliceAxis("z");
   camera.position.set(1.55, 1.25, 1.65);
   controls.target.set(0, 0, 0);
@@ -1113,6 +1296,100 @@ async function loadPreview() {
   elements.stride.textContent = `${payload.stats.stride}`;
   setProgress(100);
   setStatus("Ready", false);
+}
+
+function startSlicePrecache(reason = "Caching slices") {
+  precacheAllSlices(reason).catch((error) => {
+    console.warn("Slice cache failed", error);
+    if (elements.message.classList.contains("is-cache-status")) {
+      hideLoadingScreen();
+    }
+  });
+}
+
+async function precacheAllSlices(reason = "Caching slices") {
+  if (!state.volume || !state.sliceShape) {
+    return;
+  }
+
+  const runId = precacheRunId + 1;
+  precacheRunId = runId;
+  const jobs = [];
+  const axisIndices = Object.fromEntries(sliceAxes.map((axis) => {
+    const count = Math.max(0, state.sliceShape[axis]);
+    const center = Math.max(0, Math.min(count - 1, state.currentSlices[axis] || 0));
+    const indices = [];
+    for (let offset = 0; indices.length < count; offset += 1) {
+      const lower = center - offset;
+      const upper = center + offset;
+      if (lower >= 0) {
+        indices.push(lower);
+      }
+      if (offset > 0 && upper < count) {
+        indices.push(upper);
+      }
+    }
+    return [axis, indices];
+  }));
+  const maxAxisCount = Math.max(...sliceAxes.map((axis) => axisIndices[axis].length));
+  for (let offset = 0; offset < maxAxisCount; offset += 1) {
+    sliceAxes.forEach((axis) => {
+      const index = axisIndices[axis][offset];
+      if (Number.isInteger(index)) {
+        jobs.push({ axis, index });
+      }
+    });
+  }
+
+  if (jobs.length === 0) {
+    return;
+  }
+
+  let completed = 0;
+  setStatus(reason, true);
+  setProgress(0);
+  showLoadingScreen(reason, `Preparing ${jobs.length.toLocaleString()} X/Y/Z slices`);
+
+  const batches = [];
+  for (let start = 0; start < jobs.length; start += slicePrecacheBatchSize) {
+    batches.push(jobs.slice(start, start + slicePrecacheBatchSize));
+  }
+
+  for (const [batchIndex, batch] of batches.entries()) {
+    if (runId !== precacheRunId) {
+      return;
+    }
+
+    await Promise.all(batch.map(async (job) => {
+      try {
+        await loadSlice(job.axis, {
+          index: job.index,
+          maxSize: highDetailSliceMaxSize,
+          render: false,
+          prefetch: true
+        });
+      } catch (error) {
+        console.warn(`Could not cache ${job.axis} slice ${job.index}`, error);
+      }
+    }));
+
+    completed += batch.length;
+    const percent = Math.round((completed / jobs.length) * 100);
+    setProgress(percent);
+    showLoadingScreen(
+      reason,
+      `Batch ${batchIndex + 1} / ${batches.length} · ${completed.toLocaleString()} / ${jobs.length.toLocaleString()} slices cached`
+    );
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+
+  if (runId !== precacheRunId) {
+    return;
+  }
+
+  setProgress(100);
+  setStatus("Ready", false);
+  hideLoadingScreen();
 }
 
 function prefetchNeighborSlices(axis) {
@@ -1140,12 +1417,24 @@ function prefetchNeighborSlices(axis) {
 
 function scheduleInteractiveSlice(axis) {
   clearTimeout(sliceTimers[axis]);
-  loadSlice(axis, { maxSize: interactiveSliceMaxSize }).catch(showError);
-  sliceTimers[axis] = setTimeout(() => {
-    loadSlice(axis, { maxSize: highDetailSliceMaxSize })
-      .then(() => prefetchNeighborSlices(axis))
-      .catch(showError);
-  }, 140);
+  const cachedHighDetail = getCachedSlice(axis, state.currentSlices[axis], highDetailSliceMaxSize);
+  if (cachedHighDetail) {
+    renderSlice(axis, cachedHighDetail);
+    prefetchNeighborSlices(axis);
+    return;
+  }
+
+  const requestedIndex = state.currentSlices[axis];
+  setStatus("Loading slice", true);
+  loadSlice(axis, {
+    index: requestedIndex,
+    maxSize: highDetailSliceMaxSize
+  })
+    .then(() => {
+      setStatus("Ready", false);
+      prefetchNeighborSlices(axis);
+    })
+    .catch(showError);
 }
 
 function renderSlice(axis, slice) {
@@ -1250,6 +1539,54 @@ async function uploadZarrFolder() {
   await loadPreview();
 }
 
+async function uploadLabelsFolder() {
+  const files = Array.from(elements.labelsUpload.files || []);
+  if (files.length === 0 || !state.selectedScan || !state.volume) {
+    return;
+  }
+
+  setStatus("Uploading labels", true);
+  setProgress(18);
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file, file.webkitRelativePath || file.name);
+  });
+
+  const params = new URLSearchParams({ path: state.selectedScan });
+  const response = await fetch(`/api/upload-picks?${params.toString()}`, {
+    method: "POST",
+    body: formData
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "Label upload failed");
+  }
+
+  state.detections = payload.detections || [];
+  state.selectedDetection = null;
+  state.selectedMolecule = null;
+  state.expandedMolecules.clear();
+  const initialGroups = getMoleculeGroups();
+  if (initialGroups.length > 0) {
+    state.expandedMolecules.add(initialGroups[0].molecule);
+  }
+
+  sliceCache.clear();
+  if (state.vivActive) {
+    updateVivLayers();
+  } else {
+    renderVolumeScene(state.volume);
+  }
+  renderDetectionList();
+  renderAnalysis(payload.analysis);
+  await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
+  startSlicePrecache("Caching label overlays");
+
+  elements.detectionCount.textContent = `${initialGroups.length} type${initialGroups.length !== 1 ? "s" : ""} · ${state.detections.length} picks`;
+  setProgress(100);
+  setStatus(`Loaded ${payload.jsonFiles} label files`, false);
+}
+
 async function openLocalZarrPath() {
   const localPath = elements.localZarrPath.value.trim();
   if (!localPath) {
@@ -1345,6 +1682,7 @@ elements.pointSize.addEventListener("input", () => {
   }
 });
 elements.upload.addEventListener("change", () => uploadZarrFolder().catch(showError));
+elements.labelsUpload.addEventListener("change", () => uploadLabelsFolder().catch(showError));
 elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch(showError));
 elements.resetCamera.addEventListener("click", () => {
   if (state.vivActive && vivDeck && vivLoader) {
@@ -1389,6 +1727,7 @@ window.addEventListener("resize", resizeViewer);
 function showError(error) {
   setStatus("Error", false);
   setProgress(0);
+  elements.message.classList.remove("is-cache-status");
   elements.message.hidden = false;
   elements.message.textContent = error.message;
   console.error(error);

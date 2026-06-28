@@ -9,6 +9,7 @@ const port = Number.parseInt(process.env.PORT || "3000", 10);
 const publicDir = __dirname;
 const sampleDir = path.join(__dirname, "sample_data");
 const uploadsDir = path.join(__dirname, "uploaded_scans");
+const labelUploadsDir = path.join(__dirname, "uploaded_labels");
 const slicerExportDir = path.join(os.tmpdir(), "qbi-slicer-exports");
 const volumeCache = new Map();
 const volumeLoadCache = new Map();
@@ -18,6 +19,29 @@ let sliceCacheBytes = 0;
 const maxSliceCacheBytes = 96 * 1024 * 1024;
 const localScans = new Map();
 const pickCache = new Map();
+
+function loadEnvFile() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+
+  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) {
+      return;
+    }
+    const separator = trimmed.indexOf("=");
+    const key = trimmed.slice(0, separator).trim();
+    const value = trimmed.slice(separator + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  });
+}
+
+loadEnvFile();
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -113,6 +137,66 @@ async function readRequestJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
+async function readMultipartFolder(req, targetRoot, maxBytes = 1_000_000_000) {
+  await fsp.mkdir(targetRoot, { recursive: true });
+  const chunks = [];
+  let total = 0;
+
+  req.on("data", (chunk) => {
+    chunks.push(chunk);
+    total += chunk.length;
+    if (total > maxBytes) {
+      req.destroy();
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    req.on("error", reject);
+    req.on("end", async () => {
+      try {
+        const boundaryMatch = /boundary=(.+)$/.exec(req.headers["content-type"] || "");
+        if (!boundaryMatch) {
+          resolve({ error: "Multipart boundary not found", files: 0 });
+          return;
+        }
+
+        const boundary = `--${boundaryMatch[1]}`;
+        const body = Buffer.concat(chunks);
+        const parts = body.toString("latin1").split(boundary).slice(1, -1);
+        let files = 0;
+
+        for (const part of parts) {
+          const separator = part.indexOf("\r\n\r\n");
+          if (separator === -1) {
+            continue;
+          }
+
+          const headers = part.slice(0, separator);
+          const filenameMatch = /filename="([^"]+)"/.exec(headers);
+          if (!filenameMatch) {
+            continue;
+          }
+
+          const relativeName = filenameMatch[1].split(/[\\/]/).map(safeSegment).join(path.sep);
+          const targetPath = path.join(targetRoot, relativeName);
+          if (!targetPath.startsWith(targetRoot)) {
+            continue;
+          }
+
+          const payload = Buffer.from(part.slice(separator + 4, -2), "latin1");
+          await fsp.mkdir(path.dirname(targetPath), { recursive: true });
+          await fsp.writeFile(targetPath, payload);
+          files += 1;
+        }
+
+        resolve({ files });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
 async function listZarrLevels(zarrPath) {
   let entries = [];
   try {
@@ -180,6 +264,326 @@ function pickColor(type, index) {
   return palette[index % palette.length];
 }
 
+function pickRadiusAngstrom(type) {
+  const radii = {
+    "apo-ferritin": 60,
+    "beta-amylase": 65,
+    "beta-galactosidase": 90,
+    "ribosome": 150,
+    "thyroglobulin": 130,
+    "virus-like-particle": 135
+  };
+  return radii[type] || 80;
+}
+
+const moleculeDifficulty = {
+  "apo-ferritin": "easy",
+  "beta-amylase": "impossible, not scored",
+  "beta-galactosidase": "hard",
+  "ribosome": "easy",
+  "thyroglobulin": "hard",
+  "virus-like-particle": "easy"
+};
+
+function buildMoleculeAggregation(detections, jsonFiles = 0, volume = null) {
+  const groups = new Map();
+  detections.forEach((detection) => {
+    const molecule = detection.molecule || detection.type || "unknown";
+    if (!groups.has(molecule)) {
+      groups.set(molecule, {
+        molecule,
+        label: detection.type || formatMoleculeName(molecule),
+        color: detection.color || pickColor(molecule, groups.size),
+        difficulty: moleculeDifficulty[molecule] || "unknown",
+        count: 0
+      });
+    }
+    groups.get(molecule).count += 1;
+  });
+
+  const total = detections.length;
+  const items = [...groups.values()]
+    .sort((a, b) => b.count - a.count)
+    .map((item) => {
+      const clusterThresholdAngstroms = Math.max(80, pickRadiusAngstrom(item.molecule) * 1.5);
+      const clusters = clusterDetections(
+        detections.filter((detection) => detection.molecule === item.molecule),
+        clusterThresholdAngstroms
+      );
+
+      return {
+        ...item,
+        frequencyPercent: total > 0 ? (item.count / total) * 100 : 0,
+        clusterThresholdAngstroms,
+        clusterCount: clusters.length,
+        clusters: clusters.map((cluster, clusterIndex) => ({
+          id: `${item.molecule}-cluster-${String(clusterIndex + 1).padStart(3, "0")}`,
+          count: cluster.count,
+          centroid: cluster.centroid,
+          bounds: cluster.bounds,
+          points: cluster.points
+        }))
+      };
+    });
+
+  return {
+    totalPicks: total,
+    jsonFiles,
+    volume,
+    totalClusters: items.reduce((sum, item) => sum + item.clusterCount, 0),
+    items
+  };
+}
+
+function buildVolumeMetadata(shape, spacing) {
+  const dimensions = {
+    z: Number(shape?.z || 0),
+    y: Number(shape?.y || 0),
+    x: Number(shape?.x || 0)
+  };
+  const voxelSpacing = spacing
+    ? {
+        z: Number(spacing.z || 1),
+        y: Number(spacing.y || 1),
+        x: Number(spacing.x || 1)
+      }
+    : { z: 1, y: 1, x: 1 };
+  const physicalSizeAngstroms = {
+    z: dimensions.z * voxelSpacing.z,
+    y: dimensions.y * voxelSpacing.y,
+    x: dimensions.x * voxelSpacing.x
+  };
+
+  return {
+    dimensions,
+    voxelSpacing,
+    physicalSizeAngstroms
+  };
+}
+
+function clusterDetections(points, thresholdAngstroms) {
+  const clusters = [];
+  const visited = new Set();
+
+  function distance(a, b) {
+    const dx = a.physical.x - b.physical.x;
+    const dy = a.physical.y - b.physical.y;
+    const dz = a.physical.z - b.physical.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  for (let index = 0; index < points.length; index += 1) {
+    if (visited.has(index)) {
+      continue;
+    }
+
+    const queue = [index];
+    const clusterIndexes = [];
+    visited.add(index);
+
+    while (queue.length > 0) {
+      const current = queue.pop();
+      clusterIndexes.push(current);
+
+      for (let candidate = 0; candidate < points.length; candidate += 1) {
+        if (visited.has(candidate)) {
+          continue;
+        }
+        if (distance(points[current], points[candidate]) <= thresholdAngstroms) {
+          visited.add(candidate);
+          queue.push(candidate);
+        }
+      }
+    }
+
+    const members = clusterIndexes.map((clusterIndex) => points[clusterIndex]);
+    const count = members.length;
+    const centroid = {
+      x: members.reduce((sum, item) => sum + item.physical.x, 0) / count,
+      y: members.reduce((sum, item) => sum + item.physical.y, 0) / count,
+      z: members.reduce((sum, item) => sum + item.physical.z, 0) / count
+    };
+    const bounds = members.reduce((acc, item) => {
+      acc.min.x = Math.min(acc.min.x, item.physical.x);
+      acc.min.y = Math.min(acc.min.y, item.physical.y);
+      acc.min.z = Math.min(acc.min.z, item.physical.z);
+      acc.max.x = Math.max(acc.max.x, item.physical.x);
+      acc.max.y = Math.max(acc.max.y, item.physical.y);
+      acc.max.z = Math.max(acc.max.z, item.physical.z);
+      return acc;
+    }, {
+      min: { x: Number.POSITIVE_INFINITY, y: Number.POSITIVE_INFINITY, z: Number.POSITIVE_INFINITY },
+      max: { x: Number.NEGATIVE_INFINITY, y: Number.NEGATIVE_INFINITY, z: Number.NEGATIVE_INFINITY }
+    });
+
+    clusters.push({
+      count,
+      centroid,
+      bounds,
+      points: members.map((member) => ({
+        id: member.id,
+        voxel: member.voxel,
+        physical: member.physical
+      }))
+    });
+  }
+
+  clusters.sort((a, b) => b.count - a.count);
+  return clusters;
+}
+
+function buildLocalAnalysisSummary(aggregation) {
+  if (!aggregation.items.length) {
+    return "No uploaded molecule labels were available for analysis.";
+  }
+
+  const dominant = aggregation.items[0];
+  const hardItems = aggregation.items.filter((item) => item.difficulty.includes("hard"));
+  const easyItems = aggregation.items.filter((item) => item.difficulty === "easy");
+
+  return [
+    "### Dataset Composition",
+    `The uploaded labels contain ${aggregation.totalPicks.toLocaleString()} curated molecule picks across ${aggregation.items.length} scored molecule classes. The most frequent class is ${dominant.label} with ${dominant.count.toLocaleString()} picks (${dominant.frequencyPercent.toFixed(1)}%).`,
+    "### Biological Signal",
+    "The frequencies can support dataset-level quality control and hypothesis generation, but they should not be treated as direct drug-response evidence by themselves. CryoET pick counts are affected by sample preparation, annotation policy, tomogram coverage, particle visibility, and scoring difficulty.",
+    "### Downstream Use",
+    `Easy classes (${easyItems.map((item) => item.label).join(", ") || "none"}) are useful as positive controls for viewer alignment and label quality. Hard classes (${hardItems.map((item) => item.label).join(", ") || "none"}) are better interpreted cautiously and may be useful for benchmarking model sensitivity.`,
+    "### Drug Discovery Relevance",
+    "This summary can help prioritize downstream review by showing which complexes are abundant or sparse in the uploaded run. To connect this to drug mechanism, the counts would need comparison against matched control/treatment tomograms, replicate runs, and normalized acquisition volume."
+  ].join("\n\n");
+}
+
+function extractClaudeText(payload) {
+  const parts = [];
+  for (const content of payload?.content || []) {
+    if (typeof content?.text === "string") {
+      parts.push(content.text);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+function buildClaudeAnalysisInput(aggregation) {
+  return {
+    volume: aggregation.volume,
+    totalPicks: aggregation.totalPicks,
+    totalClusters: aggregation.totalClusters,
+    jsonFiles: aggregation.jsonFiles,
+    items: aggregation.items.map((item) => ({
+      molecule: item.molecule,
+      label: item.label,
+      difficulty: item.difficulty,
+      count: item.count,
+      frequencyPercent: Number(item.frequencyPercent.toFixed(3)),
+      clusterThresholdAngstroms: Number(item.clusterThresholdAngstroms.toFixed(3)),
+      clusterCount: item.clusterCount,
+      clusters: item.clusters.map((cluster) => ({
+        id: cluster.id,
+        count: cluster.count,
+        centroid: {
+          x: Number(cluster.centroid.x.toFixed(3)),
+          y: Number(cluster.centroid.y.toFixed(3)),
+          z: Number(cluster.centroid.z.toFixed(3))
+        },
+        bounds: {
+          min: {
+            x: Number(cluster.bounds.min.x.toFixed(3)),
+            y: Number(cluster.bounds.min.y.toFixed(3)),
+            z: Number(cluster.bounds.min.z.toFixed(3))
+          },
+          max: {
+            x: Number(cluster.bounds.max.x.toFixed(3)),
+            y: Number(cluster.bounds.max.y.toFixed(3)),
+            z: Number(cluster.bounds.max.z.toFixed(3))
+          }
+        }
+      }))
+    }))
+  };
+}
+
+function buildClaudeSystemPrompt() {
+  return [
+    "You analyze CryoET object-pick label summaries for research triage.",
+    "Be scientifically cautious.",
+    "Do not claim clinical, mechanistic, or drug-response conclusions from a single uploaded label folder.",
+    "Use only the supplied aggregated counts.",
+    "If the data is insufficient, say so plainly.",
+    "Write a concise report with headings: Dataset Composition, Frequency Interpretation, Caveats, Downstream Use, Drug-Discovery Relevance, Next Validation Steps."
+  ].join(" ");
+}
+
+function buildClaudeUserPrompt(aggregation) {
+  const input = buildClaudeAnalysisInput(aggregation);
+  return [
+    "Create a concise research-style report from the JSON below.",
+    "Only use the fields in the JSON and do not infer extra measurements.",
+    "If a molecule has no observations, do not fabricate one.",
+    "JSON:",
+    JSON.stringify(input, null, 2)
+  ].join("\n\n");
+}
+
+async function generateClaudeAnalysis(aggregation) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { report: buildLocalAnalysisSummary(aggregation), reportStatus: "Local summary" };
+  }
+
+  const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 900,
+      temperature: 0.2,
+      system: buildClaudeSystemPrompt(),
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: buildClaudeUserPrompt(aggregation)
+            }
+          ]
+        }
+      ]
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    let message = body || `Claude request failed with HTTP ${response.status}`;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed?.error?.message) {
+        message = parsed.error.message;
+      }
+    } catch {
+      // Keep the raw response excerpt.
+    }
+    return {
+      report: `${buildLocalAnalysisSummary(aggregation)}\n\n### Claude Report Status\n${message}`,
+      reportStatus: `Claude unavailable (${response.status})`,
+      reportError: message,
+      reportErrorBody: body,
+      reportErrorStatus: response.status
+    };
+  }
+
+  const payload = await response.json();
+  return {
+    report: extractClaudeText(payload) || buildLocalAnalysisSummary(aggregation),
+    reportStatus: `Claude · ${model}`
+  };
+}
+
 function parseVoxelSpacingFromPath(zarrPath) {
   const match = zarrPath.match(/VoxelSpacing([0-9.]+)/i);
   const parsed = match ? Number.parseFloat(match[1]) : NaN;
@@ -224,12 +628,19 @@ async function loadPickDetections(zarrPath, levelZeroShape) {
     return pickCache.get(cacheKey);
   }
 
-  const spacing = await readLevelZeroSpacing(zarrPath);
   const entries = await fsp.readdir(picksPath, { withFileTypes: true }).catch(() => []);
   const files = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
     .map((entry) => path.join(picksPath, entry.name))
     .sort();
+  const detections = await buildPickDetectionsFromFiles(zarrPath, levelZeroShape, files, path.basename(path.dirname(path.dirname(picksPath))));
+
+  pickCache.set(cacheKey, detections);
+  return detections;
+}
+
+async function buildPickDetectionsFromFiles(zarrPath, levelZeroShape, files, volumeLabel = "uploaded labels") {
+  const spacing = await readLevelZeroSpacing(zarrPath);
   const detections = [];
 
   for (const [fileIndex, filePath] of files.entries()) {
@@ -238,6 +649,8 @@ async function loadPickDetections(zarrPath, levelZeroShape) {
     const type = payload?.pickable_object_name || path.basename(filePath, ".json");
     const label = formatMoleculeName(type);
     const color = pickColor(type, fileIndex);
+    const radiusAngstrom = pickRadiusAngstrom(type);
+    const radiusVoxel = radiusAngstrom / ((spacing.x + spacing.y + spacing.z) / 3);
 
     points.forEach((point, pointIndex) => {
       const location = point.location || {};
@@ -262,8 +675,10 @@ async function loadPickDetections(zarrPath, levelZeroShape) {
         type: label,
         molecule: type,
         confidence: "curated pick",
-        volume: payload?.run_name || path.basename(path.dirname(path.dirname(picksPath))),
+        volume: payload?.run_name || volumeLabel,
         color,
+        radiusAngstrom,
+        radiusVoxel,
         coords: [
           (clipped.x / Math.max(1, levelZeroShape.x - 1)) - 0.5,
           (clipped.y / Math.max(1, levelZeroShape.y - 1)) - 0.5,
@@ -286,7 +701,6 @@ async function loadPickDetections(zarrPath, levelZeroShape) {
     });
   }
 
-  pickCache.set(cacheKey, detections);
   return detections;
 }
 
@@ -671,39 +1085,6 @@ async function openInSlicer(filePath) {
   return true;
 }
 
-function buildDetections(volume) {
-  const { shape } = volume;
-  return [
-    {
-      id: "M01",
-      type: "candidate ribosome",
-      confidence: "sample label",
-      volume: "preview marker",
-      position: `X ${Math.round(shape.x * 0.36)}, Y ${Math.round(shape.y * 0.46)}, Z ${Math.round(shape.z * 0.42)}`,
-      coords: [-0.14, -0.04, -0.08],
-      notes: "Placeholder detection. This is where AI model output can be attached."
-    },
-    {
-      id: "M02",
-      type: "candidate membrane complex",
-      confidence: "sample label",
-      volume: "preview marker",
-      position: `X ${Math.round(shape.x * 0.62)}, Y ${Math.round(shape.y * 0.54)}, Z ${Math.round(shape.z * 0.58)}`,
-      coords: [0.12, 0.04, 0.08],
-      notes: "Clicking this marker uses the same selection path future detections will use."
-    },
-    {
-      id: "M03",
-      type: "candidate vesicle",
-      confidence: "sample label",
-      volume: "preview marker",
-      position: `X ${Math.round(shape.x * 0.52)}, Y ${Math.round(shape.y * 0.31)}, Z ${Math.round(shape.z * 0.64)}`,
-      coords: [0.02, -0.19, 0.14],
-      notes: "The current marker positions are illustrative until model detections are available."
-    }
-  ];
-}
-
 function renderPythonZarrSlice(zarrPath, level, axis, requestedIndex, maxSize) {
   const script = `
 import json
@@ -937,6 +1318,8 @@ async function handleApi(req, res) {
     }
     const levelZeroShape = levelShapes["0"] || shape;
     const pickDetections = await loadPickDetections(zarrPath, levelZeroShape);
+    const spacing = await readLevelZeroSpacing(zarrPath);
+    const aggregation = buildMoleculeAggregation(pickDetections, 0, buildVolumeMetadata(levelZeroShape, spacing));
 
     sendJson(res, 200, {
       level: resolvedLevel,
@@ -945,7 +1328,7 @@ async function handleApi(req, res) {
       shape,
       stats: { min: 0, max: 0, points: 0, stride },
       points: [],
-      detections: pickDetections.length > 0 ? pickDetections : buildDetections({ shape })
+      detections: pickDetections
     });
     return;
   }
@@ -1034,6 +1417,65 @@ async function handleApi(req, res) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/upload-picks") {
+    const zarrPath = resolveScanPath(url.searchParams.get("path"));
+    if (!zarrPath) {
+      sendJson(res, 400, { error: "Select a valid Zarr scan before uploading labels" });
+      return;
+    }
+
+    const uploadId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const targetRoot = path.join(labelUploadsDir, uploadId);
+    const upload = await readMultipartFolder(req, targetRoot, 50_000_000);
+    if (upload.error) {
+      sendJson(res, 400, { error: upload.error });
+      return;
+    }
+
+    const jsonFiles = [];
+    async function collectJsonFiles(dir) {
+      const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await collectJsonFiles(entryPath);
+        } else if (entry.isFile() && entry.name.endsWith(".json")) {
+          jsonFiles.push(entryPath);
+        }
+      }
+    }
+    await collectJsonFiles(targetRoot);
+    jsonFiles.sort();
+
+    if (jsonFiles.length === 0) {
+      sendJson(res, 400, { error: "No pick JSON files were found in the uploaded labels folder" });
+      return;
+    }
+
+    const levelShapes = await readZarrLevelShapes(zarrPath);
+    const levelZeroShape = levelShapes["0"] || Object.values(levelShapes)[0];
+    if (!levelZeroShape) {
+      sendJson(res, 400, { error: "Could not read the selected Zarr shape for label scaling" });
+      return;
+    }
+    const spacing = await readLevelZeroSpacing(zarrPath);
+    const volume = buildVolumeMetadata(levelZeroShape, spacing);
+
+    const detections = await buildPickDetectionsFromFiles(zarrPath, levelZeroShape, jsonFiles, "uploaded labels");
+    const aggregation = buildMoleculeAggregation(detections, jsonFiles.length, volume);
+    const aiAnalysis = await generateClaudeAnalysis(aggregation);
+    sendJson(res, 200, {
+      files: upload.files,
+      jsonFiles: jsonFiles.length,
+      detections,
+      analysis: {
+        aggregation,
+        ...aiAnalysis
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/upload-zarr") {
     await fsp.mkdir(uploadsDir, { recursive: true });
     const scanId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
@@ -1117,6 +1559,10 @@ const server = http.createServer((req, res) => {
   if (!["GET", "HEAD"].includes(req.method)) {
     send(res, 405, "Method Not Allowed");
     return;
+  }
+
+  if (new URL(req.url, `http://localhost:${port}`).pathname === "/test3d") {
+    req.url = "/test3d.html";
   }
 
   let filePath;

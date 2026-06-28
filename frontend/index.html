@@ -46,13 +46,14 @@
               <select id="scan-select"></select>
             </label>
             <label>
-              Preview scale
-              <select id="level-select">
-                <option value="2" selected>Level 2 - fastest overview</option>
-                <option value="1">Level 1 - mid detail</option>
-                <option value="0">Level 0 - full resolution</option>
-              </select>
+              Upload labels
+              <input id="labels-upload" type="file" multiple webkitdirectory directory accept=".json,application/json">
             </label>
+            <select id="level-select" hidden aria-hidden="true">
+              <option value="2" selected>Level 2 - fastest overview</option>
+              <option value="1">Level 1 - mid detail</option>
+              <option value="0">Level 0 - full resolution</option>
+            </select>
           </div>
         </section>
 
@@ -151,21 +152,12 @@
 
           <article class="panel detail-panel">
             <div class="panel-heading">
-              <h2>Slice previews</h2>
+              <h2>Dataset analysis</h2>
+              <span id="analysis-status" class="status-pill">Waiting for labels</span>
             </div>
-            <div class="slice-preview-grid">
-              <div class="slice-preview-item">
-                <span id="x-slice-label" class="status-pill axis-x">X -</span>
-                <canvas id="x-slice-canvas" class="slice-preview" width="158" height="158" aria-label="X axis tomogram slice preview"></canvas>
-              </div>
-              <div class="slice-preview-item">
-                <span id="y-slice-label" class="status-pill axis-y">Y -</span>
-                <canvas id="y-slice-canvas" class="slice-preview" width="158" height="158" aria-label="Y axis tomogram slice preview"></canvas>
-              </div>
-              <div class="slice-preview-item">
-                <span id="z-slice-label" class="status-pill axis-z">Z -</span>
-                <canvas id="z-slice-canvas" class="slice-preview" width="158" height="158" aria-label="Z axis tomogram slice preview"></canvas>
-              </div>
+            <div id="analysis-summary" class="analysis-summary"></div>
+            <div id="analysis-report" class="analysis-report">
+              Upload a Picks labels folder to generate molecule counts and a Claude-backed interpretation.
             </div>
           </article>
 

@@ -20,6 +20,7 @@ Thumbs.db
 
 # Runtime/generated data
 uploaded_scans/
+uploaded_labels/
 sample_data/
 *.log
 *.tmp
@@ -36,3 +37,6 @@ dist/
 build/
 .cache/
 coverage/
+
+# Local third-party reference checkout
+vendor/viv-repo/
