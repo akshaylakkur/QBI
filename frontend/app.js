@@ -1,5 +1,14 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import {
+  Deck,
+  COORDINATE_SYSTEM,
+  ScatterplotLayer,
+  VolumeLayer,
+  VolumeView,
+  getDefaultInitialViewState,
+  loadOmeZarr
+} from "./vendor/viv-bundle.js";
 
 const state = {
   scans: [],
@@ -10,10 +19,25 @@ const state = {
   sliceLevel: "0",
   detections: [],
   selectedDetection: null,
+  selectedMolecule: null,
+  expandedMolecules: new Set(),
   currentSlices: { x: 0, y: 0, z: 0 },
   activeSliceAxis: "z",
-  autoRotate: false
+  autoRotate: false,
+  vivActive: false
 };
+
+function getMoleculeGroups() {
+  const map = new Map();
+  state.detections.forEach((det) => {
+    const key = det.molecule || det.type;
+    if (!map.has(key)) {
+      map.set(key, { molecule: key, label: det.type, color: det.color || "#0b7f83", picks: [] });
+    }
+    map.get(key).picks.push(det);
+  });
+  return [...map.values()];
+}
 
 const highDetailSliceLevel = "0";
 const highDetailSliceMaxSize = "1024";
@@ -22,6 +46,10 @@ const sliceAxes = ["x", "y", "z"];
 const sliceCache = new Map();
 const sliceTimers = { x: null, y: null, z: null };
 const prefetchTimers = { x: null, y: null, z: null };
+let vivDeck = null;
+let vivLoader = null;
+let vivView = null;
+let vivViewState = null;
 
 const elements = {
   viewer: document.querySelector("#volume-viewer"),
@@ -41,6 +69,7 @@ const elements = {
   range: document.querySelector("#volume-range"),
   stride: document.querySelector("#volume-stride"),
   detectionCount: document.querySelector("#detection-count"),
+  showAllBtn: document.querySelector("#show-all-molecules"),
   detectionList: document.querySelector("#detection-list"),
   selectedId: document.querySelector("#selected-id"),
   selectedType: document.querySelector("#selected-type"),
@@ -88,6 +117,11 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 elements.viewer.appendChild(renderer.domElement);
 
+const vivContainer = document.createElement("div");
+vivContainer.className = "viv-volume-viewer";
+vivContainer.hidden = true;
+elements.viewer.appendChild(vivContainer);
+
 const mainSliceCanvas = document.createElement("canvas");
 mainSliceCanvas.className = "main-slice-canvas";
 mainSliceCanvas.width = 1;
@@ -134,6 +168,226 @@ function resizeViewer() {
   camera.aspect = rect.width / Math.max(1, rect.height);
   camera.updateProjectionMatrix();
   renderer.setSize(rect.width, rect.height, false);
+
+  if (vivDeck && state.vivActive) {
+    vivDeck.setProps({ width: rect.width, height: rect.height });
+  }
+}
+
+function scanSupportsViv(scanPath = state.selectedScan) {
+  return Boolean(scanPath && !scanPath.startsWith("local:"));
+}
+
+function scanPathToVivUrl(scanPath) {
+  return `/${String(scanPath).split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function sliceInterval(axis) {
+  const shape = state.sliceShape || state.volume?.shape;
+  if (!shape) {
+    return null;
+  }
+  const voxel = state.currentSlices[axis];
+  if (axis === "y") {
+    // Viv 3D texture has y inverted: world y=0 = image bottom (voxel y=max)
+    const worldY = shape.y - voxel;
+    return [worldY, worldY];
+  }
+  if (axis === "z") {
+    // Volume is loaded at coarser resolution; z world units = level-0 z / 2^resolution
+    const res = vivLoader ? Math.max(0, vivLoader.length - 1) : 0;
+    const worldZ = voxel / (2 ** res);
+    return [worldZ, worldZ];
+  }
+  // x: world x ≈ level-0 voxel x directly
+  return [voxel, voxel];
+}
+
+function detectionColorArray(detection) {
+  const fallback = [11, 127, 131];
+  const hex = String(detection.color || "").replace("#", "");
+  if (!/^[0-9a-f]{6}$/i.test(hex)) {
+    return fallback;
+  }
+  return [
+    Number.parseInt(hex.slice(0, 2), 16),
+    Number.parseInt(hex.slice(2, 4), 16),
+    Number.parseInt(hex.slice(4, 6), 16)
+  ];
+}
+
+function detectionColorNumber(detection) {
+  const [r, g, b] = detectionColorArray(detection);
+  return (r << 16) + (g << 8) + b;
+}
+
+function vivDetectionPosition(detection) {
+  const shape = state.sliceShape || state.volume?.levelShapes?.["0"] || state.volume?.shape || { x: 1, y: 1, z: 1 };
+  const res = vivLoader ? Math.max(0, vivLoader.length - 1) : 0;
+  const voxel = detection.voxel && Number.isFinite(detection.voxel.x)
+    ? detection.voxel
+    : {
+        x: (detection.coords?.[0] + 0.5) * Math.max(1, shape.x - 1),
+        y: (detection.coords?.[1] + 0.5) * Math.max(1, shape.y - 1),
+        z: (detection.coords?.[2] + 0.5) * Math.max(1, shape.z - 1)
+      };
+  // Viv world coords: x ≈ voxel x, y is inverted (world y=0 at image bottom),
+  // z is scaled to the loaded resolution level
+  return [voxel.x, shape.y - voxel.y, voxel.z / (2 ** res)];
+}
+
+function vivLayerProps() {
+  return {
+    id: "qbi-viv-volume",
+    loader: vivLoader,
+    contrastLimits: [[-0.00004, 0.00002]],
+    domain: [[-0.0001, 0.0001]],
+    colors: [[255, 255, 255]],
+    channelsVisible: [true],
+    selections: [{}],
+    resolution: Math.max(0, vivLoader.length - 1),
+    xSlice: sliceInterval("x"),
+    ySlice: sliceInterval("y"),
+    zSlice: sliceInterval("z"),
+    useProgressIndicator: false,
+    useWebGL1Warning: false
+  };
+}
+
+function vivDetectionLayer() {
+  const selectedId = state.selectedDetection?.id;
+  const selectedMol = state.selectedMolecule;
+
+  return new ScatterplotLayer({
+    id: "qbi-pick-overlay",
+    data: state.detections,
+    pickable: true,
+    coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+    opacity: 0.9,
+    stroked: true,
+    filled: true,
+    lineWidthMinPixels: 1,
+    radiusMinPixels: 3,
+    radiusMaxPixels: 14,
+    getPosition: vivDetectionPosition,
+    getRadius: (det) => {
+      if (det.id === selectedId) return 140;
+      const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
+      return inGroup ? 90 : 60;
+    },
+    getFillColor: (det) => {
+      if (det.id === selectedId) return [255, 185, 50, 255];
+      const c = detectionColorArray(det);
+      const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
+      return [...c, inGroup ? 210 : 80];
+    },
+    getLineColor: (det) => {
+      if (det.id === selectedId) return [255, 255, 255, 255];
+      const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
+      return [12, 22, 30, inGroup ? 220 : 50];
+    },
+    updateTriggers: {
+      getFillColor: [selectedId, selectedMol],
+      getLineColor: [selectedId, selectedMol],
+      getRadius: [selectedId, selectedMol]
+    },
+    onClick: ({ object }) => {
+      if (object?.id) {
+        selectDetection(object.id);
+      }
+    }
+  });
+}
+
+function updateVivLayers() {
+  if (!vivDeck || !vivLoader || !state.vivActive) {
+    return;
+  }
+
+  vivDeck.setProps({
+    layers: [
+      new VolumeLayer(vivLayerProps()),
+      vivDetectionLayer()
+    ]
+  });
+}
+
+function disableVivViewer() {
+  state.vivActive = false;
+  vivContainer.hidden = true;
+  renderer.domElement.hidden = false;
+  if (vivDeck) {
+    vivDeck.finalize();
+    vivDeck = null;
+  }
+  vivLoader = null;
+  vivView = null;
+  vivViewState = null;
+}
+
+async function setupVivViewer() {
+  if (!scanSupportsViv()) {
+    disableVivViewer();
+    return false;
+  }
+
+  const rect = elements.viewer.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+
+  try {
+    const { data } = await loadOmeZarr(scanPathToVivUrl(state.selectedScan), { type: "multiscales" });
+    vivLoader = data;
+    vivViewState = {
+      ...getDefaultInitialViewState(vivLoader, { width, height }, 1, true),
+      id: "3d",
+      rotationX: 25,
+      rotationOrbit: 35
+    };
+    vivView = new VolumeView({
+      id: "3d",
+      width,
+      height,
+      target: vivViewState.target,
+      useFixedAxis: false
+    });
+
+    if (vivDeck) {
+      vivDeck.finalize();
+    }
+
+    clearGroup(volumeGroup);
+    clearGroup(labelGroup);
+    markerObjects.clear();
+    sliceAxes.forEach((axis) => {
+      slicePlaneObjects[axis] = null;
+    });
+    renderer.domElement.hidden = true;
+    vivContainer.hidden = false;
+    state.vivActive = true;
+    vivDeck = new Deck({
+      parent: vivContainer,
+      width,
+      height,
+      views: [vivView.getDeckGlView()],
+      viewState: { "3d": vivViewState },
+      controller: true,
+      useDevicePixels: false,
+      onViewStateChange: ({ viewState }) => {
+        vivViewState = { ...viewState, id: "3d" };
+        vivDeck?.setProps({ viewState: { "3d": vivViewState } });
+      },
+      layers: [
+        new VolumeLayer(vivLayerProps()),
+        vivDetectionLayer()
+      ]
+    });
+    return true;
+  } catch (error) {
+    console.warn("Viv viewer failed; falling back to Three.js slice planes.", error);
+    disableVivViewer();
+    return false;
+  }
 }
 
 function clearGroup(group) {
@@ -276,18 +530,20 @@ function createSliceGeometry(axis) {
   let positions;
 
   if (axis === "x") {
+    // Row 0 of the texture (z=0) must land at world z=-halfZ to match marker positions
     positions = [
-      0, halfY, halfZ,
-      0, -halfY, halfZ,
+      0, halfY, -halfZ,
       0, -halfY, -halfZ,
-      0, halfY, -halfZ
+      0, -halfY, halfZ,
+      0, halfY, halfZ
     ];
   } else if (axis === "y") {
+    // Same z-direction fix for the y-slice
     positions = [
-      -halfX, 0, halfZ,
-      halfX, 0, halfZ,
+      -halfX, 0, -halfZ,
       halfX, 0, -halfZ,
-      -halfX, 0, -halfZ
+      halfX, 0, halfZ,
+      -halfX, 0, halfZ
     ];
   } else {
     positions = [
@@ -535,15 +791,16 @@ function renderVolumeScene(payload) {
   frame.name = "volume-bounds";
   volumeGroup.add(frame);
 
+  const sharedGeometry = new THREE.SphereGeometry(0.016, 16, 10);
+
   payload.detections.forEach((detection) => {
-    const markerGeometry = new THREE.SphereGeometry(0.028, 24, 16);
     const markerMaterial = new THREE.MeshStandardMaterial({
-      color: detection.id === state.selectedDetection?.id ? 0xb96d12 : 0x0b7f83,
-      emissive: 0x063f42,
-      emissiveIntensity: 0.2,
+      color: detectionColorNumber(detection),
+      emissive: new THREE.Color(detectionColorNumber(detection)),
+      emissiveIntensity: 0.15,
       roughness: 0.4
     });
-    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+    const marker = new THREE.Mesh(sharedGeometry, markerMaterial);
     marker.position.set(
       detection.coords[0] * dimensions.x,
       -detection.coords[1] * dimensions.y,
@@ -554,29 +811,139 @@ function renderVolumeScene(payload) {
     markerObjects.set(detection.id, marker);
   });
 
+  updateMarkerHighlights();
   elements.message.hidden = true;
 }
 
 function renderDetectionList() {
   elements.detectionList.replaceChildren();
-  elements.detectionCount.textContent = `${state.detections.length} labels`;
+  const groups = getMoleculeGroups();
+  const totalPicks = state.detections.length;
+  elements.detectionCount.textContent = `${groups.length} type${groups.length !== 1 ? "s" : ""} · ${totalPicks} picks`;
+  elements.showAllBtn.hidden = state.selectedMolecule === null;
 
-  state.detections.forEach((detection, index) => {
-    const row = document.createElement("button");
-    row.className = "detection-row";
-    row.type = "button";
-    row.dataset.id = detection.id;
-    row.innerHTML = `
-      <span class="dot ${index === 1 ? "secondary" : index === 2 ? "accent" : ""}"></span>
-      <span>
-        <strong>${detection.id}</strong>
-        <small>${detection.type}</small>
-      </span>
-      <b>${index + 1}</b>
+  groups.forEach((group) => {
+    const isSelected = state.selectedMolecule === group.molecule;
+    const isExpanded = state.expandedMolecules.has(group.molecule);
+
+    const groupEl = document.createElement("div");
+    groupEl.className = "molecule-group";
+
+    const header = document.createElement("button");
+    header.className = `molecule-group-header${isSelected ? " is-selected" : ""}`;
+    header.type = "button";
+    header.innerHTML = `
+      <span class="dot" style="background:${group.color}"></span>
+      <span class="molecule-name">${group.label}</span>
+      <span class="pick-badge">${group.picks.length}</span>
+      <span class="expand-icon">${isExpanded ? "▾" : "▸"}</span>
     `;
-    row.addEventListener("click", () => selectDetection(detection.id));
-    elements.detectionList.append(row);
+    header.addEventListener("click", () => {
+      const alreadySelected = state.selectedMolecule === group.molecule;
+      selectMoleculeGroup(group.molecule);
+      if (alreadySelected) {
+        if (state.expandedMolecules.has(group.molecule)) {
+          state.expandedMolecules.delete(group.molecule);
+        } else {
+          state.expandedMolecules.add(group.molecule);
+        }
+      } else {
+        state.expandedMolecules.add(group.molecule);
+      }
+      renderDetectionList();
+    });
+    groupEl.append(header);
+
+    if (isExpanded) {
+      const pickList = document.createElement("div");
+      pickList.className = "molecule-pick-list";
+      group.picks.forEach((det) => {
+        const row = document.createElement("button");
+        row.className = `molecule-pick-row${det.id === state.selectedDetection?.id ? " is-selected" : ""}`;
+        row.type = "button";
+        row.dataset.id = det.id;
+        row.textContent = det.id;
+        row.addEventListener("click", (e) => {
+          e.stopPropagation();
+          selectDetection(det.id);
+        });
+        pickList.append(row);
+      });
+      groupEl.append(pickList);
+    }
+
+    elements.detectionList.append(groupEl);
   });
+}
+
+function setInfoLabel(ddElement, labelText) {
+  if (ddElement.previousElementSibling?.tagName === "DT") {
+    ddElement.previousElementSibling.textContent = labelText;
+  }
+}
+
+function showPickInfo(detection) {
+  setInfoLabel(elements.selectedId, "ID");
+  setInfoLabel(elements.selectedType, "Type");
+  setInfoLabel(elements.selectedConfidence, "Confidence");
+  setInfoLabel(elements.selectedPosition, "Position");
+  setInfoLabel(elements.selectedNotes, "Notes");
+  elements.selectedId.textContent = detection.id;
+  elements.selectedType.textContent = detection.type;
+  elements.selectedConfidence.textContent = detection.confidence;
+  elements.selectedPosition.textContent = detection.position;
+  elements.selectedNotes.textContent = detection.notes;
+}
+
+function showMoleculeGroupInfo(group) {
+  setInfoLabel(elements.selectedId, "Name");
+  setInfoLabel(elements.selectedType, "Source");
+  setInfoLabel(elements.selectedConfidence, "Picks");
+  setInfoLabel(elements.selectedPosition, "Unit");
+  setInfoLabel(elements.selectedNotes, "Notes");
+  elements.selectedId.textContent = group.label;
+  elements.selectedType.textContent = `${group.molecule}.json`;
+  elements.selectedConfidence.textContent = `${group.picks.length} curated picks`;
+  elements.selectedPosition.textContent = group.picks[0]?.physical?.unit || "angstrom";
+  elements.selectedNotes.textContent = `${group.label} curated overlay picks from the TS_5_4 experiment run.`;
+}
+
+function updateMarkerHighlights() {
+  const selectedId = state.selectedDetection?.id || null;
+  const selectedMol = state.selectedMolecule;
+
+  markerObjects.forEach((marker, markerId) => {
+    const det = marker.userData.detection;
+    const isSelected = markerId === selectedId;
+    const inGroup = !selectedMol || (det.molecule || det.type) === selectedMol;
+
+    marker.material.color.set(
+      isSelected ? 0xb96d12 : (inGroup ? detectionColorNumber(det) : 0xb8c8cc)
+    );
+    marker.material.emissiveIntensity = isSelected ? 0.35 : (inGroup ? 0.15 : 0);
+    marker.scale.setScalar(isSelected ? 1.45 : inGroup ? 1.0 : 0.6);
+  });
+}
+
+function selectMoleculeGroup(molecule) {
+  state.selectedMolecule = molecule;
+  state.selectedDetection = null;
+
+  const group = getMoleculeGroups().find((g) => g.molecule === molecule);
+  if (group) {
+    showMoleculeGroupInfo(group);
+  }
+
+  updateMarkerHighlights();
+  updateVivLayers();
+}
+
+function clearMoleculeSelection() {
+  state.selectedMolecule = null;
+  state.selectedDetection = null;
+  updateMarkerHighlights();
+  updateVivLayers();
+  renderDetectionList();
 }
 
 function selectDetection(id) {
@@ -586,25 +953,19 @@ function selectDetection(id) {
   }
 
   state.selectedDetection = detection;
-  elements.selectedId.textContent = detection.id;
-  elements.selectedType.textContent = detection.type;
-  elements.selectedConfidence.textContent = detection.confidence;
-  elements.selectedPosition.textContent = detection.position;
-  elements.selectedNotes.textContent = detection.notes;
+  state.selectedMolecule = detection.molecule || detection.type;
+  state.expandedMolecules.add(state.selectedMolecule);
 
-  document.querySelectorAll(".detection-row").forEach((row) => {
-    row.classList.toggle("is-selected", row.dataset.id === id);
-  });
-
-  markerObjects.forEach((marker, markerId) => {
-    marker.material.color.set(markerId === id ? 0xb96d12 : 0x0b7f83);
-    marker.scale.setScalar(markerId === id ? 1.45 : 1);
-  });
+  showPickInfo(detection);
+  updateMarkerHighlights();
 
   const marker = markerObjects.get(id);
   if (marker) {
     controls.target.copy(marker.position);
   }
+
+  updateVivLayers();
+  renderDetectionList();
 }
 
 async function fetchJson(url, options) {
@@ -717,6 +1078,9 @@ async function loadPreview() {
   state.sliceShape = payload.levelShapes?.[state.sliceLevel] || payload.shape;
   sliceCache.clear();
   state.detections = payload.detections;
+  state.selectedDetection = null;
+  state.selectedMolecule = null;
+  state.expandedMolecules.clear();
   state.currentSlices = {
     x: Math.floor(state.sliceShape.x / 2),
     y: Math.floor(state.sliceShape.y / 2),
@@ -729,9 +1093,15 @@ async function loadPreview() {
     elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
   });
 
-  renderVolumeScene(payload);
+  const usingViv = await setupVivViewer();
+  if (!usingViv) {
+    renderVolumeScene(payload);
+  }
+  const initialGroups = getMoleculeGroups();
+  if (initialGroups.length > 0) {
+    state.expandedMolecules.add(initialGroups[0].molecule);
+  }
   renderDetectionList();
-  selectDetection(payload.detections[0]?.id);
   await Promise.all(sliceAxes.map((axis) => loadSlice(axis)));
   setActiveSliceAxis("z");
   camera.position.set(1.55, 1.25, 1.65);
@@ -779,7 +1149,9 @@ function scheduleInteractiveSlice(axis) {
 }
 
 function renderSlice(axis, slice) {
-  updateVolumeSlicePlane(axis, slice.bytes, slice.width, slice.height);
+  if (!state.vivActive) {
+    updateVolumeSlicePlane(axis, slice.bytes, slice.width, slice.height);
+  }
   elements.sliceSliders[axis].value = String(state.currentSlices[axis]);
   elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
   drawSlicePreview(axis, slice.bytes, slice.width, slice.height, slice.renderedLevel, slice.renderedIndex);
@@ -975,6 +1347,17 @@ elements.pointSize.addEventListener("input", () => {
 elements.upload.addEventListener("change", () => uploadZarrFolder().catch(showError));
 elements.openLocalZarr.addEventListener("click", () => openLocalZarrPath().catch(showError));
 elements.resetCamera.addEventListener("click", () => {
+  if (state.vivActive && vivDeck && vivLoader) {
+    const rect = elements.viewer.getBoundingClientRect();
+    vivViewState = {
+      ...getDefaultInitialViewState(vivLoader, { width: rect.width, height: rect.height }, 1, true),
+      id: "3d",
+      rotationX: 25,
+      rotationOrbit: 35
+    };
+    vivDeck.setProps({ viewState: { "3d": vivViewState } });
+    return;
+  }
   camera.position.set(1.55, 1.25, 1.65);
   controls.target.set(0, 0, 0);
   controls.update();
@@ -985,6 +1368,7 @@ elements.rotateToggle.addEventListener("click", () => {
 });
 elements.openSlicer.addEventListener("click", () => openSelectedScanInSlicer().catch(showError));
 elements.reloadScan.addEventListener("click", () => loadPreview().catch(showError));
+elements.showAllBtn.addEventListener("click", clearMoleculeSelection);
 sliceAxes.forEach((axis) => {
   elements.sliceSliders[axis].addEventListener("input", () => {
     if (!state.volume) {
@@ -994,6 +1378,7 @@ sliceAxes.forEach((axis) => {
     elements.sliceSliderValues[axis].textContent = `${axis.toUpperCase()} ${state.currentSlices[axis]}`;
     setActiveSliceAxis(axis);
     updateSliceSeams();
+    updateVivLayers();
     refreshSlicePreviews();
     scheduleInteractiveSlice(axis);
   });

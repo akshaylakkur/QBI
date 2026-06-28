@@ -17,6 +17,7 @@ const sliceLoadCache = new Map();
 let sliceCacheBytes = 0;
 const maxSliceCacheBytes = 96 * 1024 * 1024;
 const localScans = new Map();
+const pickCache = new Map();
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -157,6 +158,136 @@ async function readZarrLevelShapes(zarrPath) {
   }));
 
   return shapes;
+}
+
+function formatMoleculeName(value) {
+  return String(value || "unknown molecule")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function pickColor(type, index) {
+  const palette = [
+    "#0ea5a6",
+    "#f97316",
+    "#7c3aed",
+    "#22c55e",
+    "#ef4444",
+    "#3b82f6",
+    "#d946ef",
+    "#eab308"
+  ];
+  return palette[index % palette.length];
+}
+
+function parseVoxelSpacingFromPath(zarrPath) {
+  const match = zarrPath.match(/VoxelSpacing([0-9.]+)/i);
+  const parsed = match ? Number.parseFloat(match[1]) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+async function readLevelZeroSpacing(zarrPath) {
+  const attrs = await readJson(path.join(zarrPath, ".zattrs")).catch(() => null);
+  const datasets = attrs?.multiscales?.[0]?.datasets || [];
+  const levelZero = datasets.find((dataset) => dataset.path === "0") || datasets[0];
+  const scale = levelZero?.coordinateTransformations?.find((item) => item.type === "scale")?.scale;
+  if (Array.isArray(scale) && scale.length >= 3 && scale.every((value) => Number.isFinite(Number(value)) && Number(value) > 0)) {
+    return { z: Number(scale[0]), y: Number(scale[1]), x: Number(scale[2]) };
+  }
+
+  const fallback = parseVoxelSpacingFromPath(zarrPath) || 1;
+  return { z: fallback, y: fallback, x: fallback };
+}
+
+function findPicksPathForZarr(zarrPath) {
+  const parts = zarrPath.split(path.sep);
+  const staticIndex = parts.lastIndexOf("static");
+  const experimentIndex = parts.lastIndexOf("ExperimentRuns");
+  if (staticIndex === -1 || experimentIndex === -1 || experimentIndex + 1 >= parts.length) {
+    return null;
+  }
+
+  const runName = parts[experimentIndex + 1];
+  const root = parts.slice(0, staticIndex).join(path.sep) || path.sep;
+  const picksPath = path.join(root, "overlay", "ExperimentRuns", runName, "Picks");
+  return fs.existsSync(picksPath) ? picksPath : null;
+}
+
+async function loadPickDetections(zarrPath, levelZeroShape) {
+  const picksPath = findPicksPathForZarr(zarrPath);
+  if (!picksPath) {
+    return [];
+  }
+
+  const cacheKey = `${picksPath}:${levelZeroShape.x}x${levelZeroShape.y}x${levelZeroShape.z}`;
+  if (pickCache.has(cacheKey)) {
+    return pickCache.get(cacheKey);
+  }
+
+  const spacing = await readLevelZeroSpacing(zarrPath);
+  const entries = await fsp.readdir(picksPath, { withFileTypes: true }).catch(() => []);
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => path.join(picksPath, entry.name))
+    .sort();
+  const detections = [];
+
+  for (const [fileIndex, filePath] of files.entries()) {
+    const payload = await readJson(filePath).catch(() => null);
+    const points = Array.isArray(payload?.points) ? payload.points : [];
+    const type = payload?.pickable_object_name || path.basename(filePath, ".json");
+    const label = formatMoleculeName(type);
+    const color = pickColor(type, fileIndex);
+
+    points.forEach((point, pointIndex) => {
+      const location = point.location || {};
+      const voxel = {
+        x: Number(location.x) / spacing.x,
+        y: Number(location.y) / spacing.y,
+        z: Number(location.z) / spacing.z
+      };
+
+      if (!Number.isFinite(voxel.x) || !Number.isFinite(voxel.y) || !Number.isFinite(voxel.z)) {
+        return;
+      }
+
+      const clipped = {
+        x: Math.max(0, Math.min(levelZeroShape.x - 1, voxel.x)),
+        y: Math.max(0, Math.min(levelZeroShape.y - 1, voxel.y)),
+        z: Math.max(0, Math.min(levelZeroShape.z - 1, voxel.z))
+      };
+
+      detections.push({
+        id: `${type}-${String(pointIndex + 1).padStart(3, "0")}`,
+        type: label,
+        molecule: type,
+        confidence: "curated pick",
+        volume: payload?.run_name || path.basename(path.dirname(path.dirname(picksPath))),
+        color,
+        coords: [
+          (clipped.x / Math.max(1, levelZeroShape.x - 1)) - 0.5,
+          (clipped.y / Math.max(1, levelZeroShape.y - 1)) - 0.5,
+          (clipped.z / Math.max(1, levelZeroShape.z - 1)) - 0.5
+        ],
+        voxel: {
+          x: clipped.x,
+          y: clipped.y,
+          z: clipped.z
+        },
+        physical: {
+          x: Number(location.x),
+          y: Number(location.y),
+          z: Number(location.z),
+          unit: payload?.unit || "angstrom"
+        },
+        position: `X ${Math.round(clipped.x)}, Y ${Math.round(clipped.y)}, Z ${Math.round(clipped.z)}`,
+        notes: `${label} curated overlay pick from ${path.basename(filePath)}. Physical position ${Math.round(Number(location.x))}, ${Math.round(Number(location.y))}, ${Math.round(Number(location.z))} ${payload?.unit || "angstrom"}.`
+      });
+    });
+  }
+
+  pickCache.set(cacheKey, detections);
+  return detections;
 }
 
 function scanPayload(id, name, scanPath, levels) {
@@ -804,6 +935,8 @@ async function handleApi(req, res) {
       sendJson(res, 400, { error: `No Zarr array metadata found in ${path.basename(zarrPath)}` });
       return;
     }
+    const levelZeroShape = levelShapes["0"] || shape;
+    const pickDetections = await loadPickDetections(zarrPath, levelZeroShape);
 
     sendJson(res, 200, {
       level: resolvedLevel,
@@ -812,7 +945,7 @@ async function handleApi(req, res) {
       shape,
       stats: { min: 0, max: 0, points: 0, stride },
       points: [],
-      detections: buildDetections({ shape })
+      detections: pickDetections.length > 0 ? pickDetections : buildDetections({ shape })
     });
     return;
   }

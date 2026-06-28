@@ -141,7 +141,10 @@
           <article class="panel detections-panel">
             <div class="panel-heading">
               <h2>Detected molecules</h2>
-              <span id="detection-count" class="status-pill">0 labels</span>
+              <div class="panel-heading-actions">
+                <span id="detection-count" class="status-pill">0 picks</span>
+                <button id="show-all-molecules" type="button" class="show-all-btn" hidden>Show all</button>
+              </div>
             </div>
             <div id="detection-list" class="detection-list"></div>
           </article>
